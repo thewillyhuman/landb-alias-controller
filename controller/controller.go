@@ -3,22 +3,34 @@ package controller
 import (
 	"context"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/plan"
-	openstack2 "gitlab.cern.ch/gfacundo/landb-alias-controller/provider/openstack"
-	v1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/dns"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal/utils"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/plan"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider" // Added
+	v1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // Controller is the main controller for the application.
-// It is responsible for reconciling the state of the OpenStack instances with the state of the Kubernetes ingresses.
+// It is responsible for reconciling the state of the DNS provider with the
+// state of the Kubernetes ingresses.
+//
+// The controller works by:
+// 1. Watching for changes to Ingress and Node resources.
+// 2. Building a desired state of DNS records from the cluster.
+// 3. Getting the current state of DNS records from the provider.
+// 4. Calculating the difference between the desired and current state.
+// 5. Applying the changes to the provider.
 type Controller struct {
 	// Client is the Kubernetes client.
 	client.Client
@@ -28,141 +40,130 @@ type Controller struct {
 	lastRunAt time.Time
 	// Interval is the reconciliation interval.
 	Interval time.Duration
-	// OpenstackClient is the OpenStack client.
-	OpenstackClient *openstack2.Client
+	// DnsProvider is the generic DNS provider (e.g., OpenStack, Route53).
+	DnsProvider provider.Provider
+	// IngressNodeLabel is the label used to select ingress nodes.
+	IngressNodeLabel string
 }
 
-// Reconcile is the main reconciliation loop.
-// It is called every time an ingress is created, updated, or deleted.
+// Reconcile is the main reconciliation loop. It is called every time an
+// ingress is created, updated, or deleted. It is also called when a node
+// with the ingress label is created, updated, or deleted.
+//
+// The reconciliation loop is idempotent. It can be called multiple times
+// without changing the result.
 func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
 	err := c.RunOnce(ctx)
 	if err != nil {
+		// Log the error but return TerminalError to prevent requeueing on
+		// what is likely a persistent configuration or provider issue.
+		log.Error(err, "Reconciliation failed")
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
-	return ctrl.Result{Requeue: false, RequeueAfter: 0}, nil
+	// Successful reconciliation, no requeue needed.
+	// The controller will be triggered again by Ingress/Node changes.
+	return ctrl.Result{}, nil
 }
 
 // RunOnce is the main logic of the controller.
-// It is called by the Reconcile function.
+// It performs a full reconciliation cycle.
 func (c *Controller) RunOnce(ctx context.Context) error {
-	log.Info("reconcile cycle initiated")
+	log := log.FromContext(ctx)
+	log.Info("Starting reconciliation cycle")
 
 	// Update the last run time for metrics.
 	c.runAtMutex.Lock()
 	c.lastRunAt = time.Now()
 	c.runAtMutex.Unlock()
 
-	clusterLanDBAliases, err := c.listIngressLanDBAliases(ctx)
+	// --- Step 1: Build Desired State ---
+	// Get the full list of desired DNS records from Kubernetes (Ingresses + Nodes)
+	desiredRecords, err := c.buildDesiredRecords(ctx)
 	if err != nil {
-		log.Errorf("error compiling landb aliases from cluster ingresses: %v", err)
-		return err // Exit the execution of the reconciliation as an empty list of aliases is dangerous.
+		log.Error(err, "Failed to build desired DNS records")
+		return err // Exit if we can't determine the desired state.
 	}
 
-	clusterIngressNodes, err := c.listIngressNodes(ctx)
+	// --- Step 2: Get Current State ---
+	// Get the current list of records from the DNS provider
+	currentRecords, err := c.DnsProvider.Records()
 	if err != nil {
-		log.Errorf("error compiling ingress nodes from api server: %v", err)
+		log.Error(err, "Failed to fetch current records from provider")
 		return err
 	}
 
-	for nodeIndex, node := range clusterIngressNodes {
-		log.Infof("reconciling ingress node %v", nodeIndex)
+	// --- Step 3: Calculate Plan ---
+	// Compute the diff (create, update, delete)
+	p := &plan.Plan{
+		Current: currentRecords,
+		Desired: desiredRecords,
+		Changes: &plan.Changes{}, // Init to empty to avoid nils.
+	}
+	calculatedPlan := p.Calculate()
 
-		// Get node openstack landb aliases.
-		currentNodeAliases, err := c.OpenstackClient.GetInstanceLanDBAliases(ctx, node)
-		if err != nil {
-			log.Errorf("error retrieving node landb aliases from openstack: %v", err)
-		}
-		log.Infof("current landb-aliases: %+v", currentNodeAliases.AsMap())
+	log.Info("Reconciliation plan calculated", "create", len(calculatedPlan.Changes.Create), "update", len(calculatedPlan.Changes.Update), "delete", len(calculatedPlan.Changes.Delete))
+	log.V(1).Info("Full reconciliation plan", "plan", calculatedPlan.ToString())
 
-		// Compute node aliases to be.
-		desiredNodeAliases := buildNodeAliasMap(clusterLanDBAliases, nodeIndex)
-		log.Infof("desired landb-aliases: %+v", desiredNodeAliases.AsMap())
-
-		plan := plan.Plan{
-			Current: currentNodeAliases,
-			Desired: desiredNodeAliases,
-		}
-
-		plan = *plan.Calculate()
-		log.Infof("computed plan for node %s: %s", node, plan.ToString())
-		updates := plan.Changes.Update
-		deletes := plan.Changes.Delete
-
-		// Perform the updates
-		err = c.OpenstackClient.SetInstanceProperties(ctx, node, updates)
-		if err != nil {
-			log.Errorf("error updating instance %s properties: %v", node, err)
-			return err
-		}
-
-		// Perform the deletes
-		for _, key := range deletes.Keys() {
-			err = c.OpenstackClient.DeleteInstanceProperty(ctx, node, key)
-			if err != nil {
-				log.Errorf("error deleting instance %s property %s: %v", node, key, err)
-				return err
-			}
-		}
-
-		log.Infof("reconciling finished for ingress node %s", node)
+	// If there are no changes, we're done.
+	if len(calculatedPlan.Changes.Create) == 0 &&
+		len(calculatedPlan.Changes.Update) == 0 &&
+		len(calculatedPlan.Changes.Delete) == 0 {
+		log.Info("Skipping reconciliation: no changes required")
+		return nil
 	}
 
-	log.Info("reconcile cycle finished")
+	// --- Step 4: Apply Plan ---
+	// Send the set of changes to the provider to execute.
+	if err := c.DnsProvider.Reconcile(calculatedPlan.Changes); err != nil {
+		log.Error(err, "Failed to apply reconciliation plan")
+		return err
+	}
+
+	log.Info("Successfully applied reconciliation plan")
 	return nil
 }
 
-// BuildNodeAliasMap generates a map of Landb alias properties for a node.
-// - clusterAliases: list of base aliases (from cluster Ingress hosts)
-// - nodeIndex: the index of the node to use in the suffix
-// Returns a map like: {"landb-alias": "...", "landb-alias2": "...", ...}
-// Each property will not exceed maxLen (254 characters).
-func buildNodeAliasMap(clusterAliases []string, nodeIndex int) *openstack2.PropertySet {
-	const maxLen = 200
-	suffix := fmt.Sprintf("load-%d-", nodeIndex)
-
-	// Build full alias strings with suffix
-	fullAliases := make([]string, 0, len(clusterAliases))
-	for _, alias := range clusterAliases {
-		fullAliases = append(fullAliases, fmt.Sprintf("%s--%s", alias, suffix))
+// buildDesiredRecords constructs the full list of desired dns.Record objects
+// based on the current cluster state (Ingresses and Nodes).
+func (c *Controller) buildDesiredRecords(ctx context.Context) ([]*dns.Record, error) {
+	log := log.FromContext(ctx)
+	// Get base aliases from Ingresses, e.g., ["app1", "app2"]
+	baseAliases, err := c.listIngressLanDBAliases(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list ingress aliases: %w", err)
 	}
 
-	// Split into multiple properties if the length exceeds maxLen
-	props := make(map[string]string)
-	current := ""
-	propIndex := 1
+	// Get all ingress node IPs, e.g., ["1.1.1.1", "2.2.2.2"]
+	nodeIPs, err := c.listIngressNodeIPs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list ingress node IPs: %w", err)
+	}
 
-	for _, a := range fullAliases {
-		if len(current)+len(a)+1 > maxLen { // +1 for comma
-			propName := "landb-alias"
-			if propIndex > 1 {
-				propName = fmt.Sprintf("landb-alias%d", propIndex)
-			}
-			props[propName] = current
-			current = a
-			propIndex++
-		} else {
-			if current != "" {
-				current += ","
-			}
-			current += a
+	if len(nodeIPs) == 0 {
+		log.V(1).Info("No ingress node IPs found. Desired record list will be empty.")
+		return []*dns.Record{}, nil // Return empty slice, not nil
+	}
+
+	var desiredRecords = make([]*dns.Record, 0)
+	for _, alias := range baseAliases {
+		rec := &dns.Record{
+			Name:   alias,
+			Type:   internal.ARecord,
+			TTL:    300,     // Default TTL. Could be made configurable.
+			Values: nodeIPs, // All aliases point to all ingress IPs
 		}
+		desiredRecords = append(desiredRecords, rec)
 	}
 
-	if current != "" {
-		propName := "landb-alias"
-		if propIndex > 1 {
-			propName = fmt.Sprintf("landb-alias%d", propIndex)
-		}
-		props[propName] = current
-	}
-
-	return openstack2.NewPropertySet(props)
+	return desiredRecords, nil
 }
 
 // listIngressLanDBAliases returns a sorted, deduplicated list of LANDB aliases
 // derived from Ingress hosts ending with "cern.ch". The ".cern.ch" suffix is removed.
 func (c *Controller) listIngressLanDBAliases(ctx context.Context) ([]string, error) {
-	log.Info("obtaining list of desired landb aliases from cluster ingresses")
+	log := log.FromContext(ctx)
+	log.V(1).Info("Listing desired aliases from ingresses")
 	ingresses := &networkingv1.IngressList{}
 	if err := c.List(ctx, ingresses); err != nil {
 		return nil, fmt.Errorf("unable to list cluster ingresses: %w", err)
@@ -171,11 +172,11 @@ func (c *Controller) listIngressLanDBAliases(ctx context.Context) ([]string, err
 	aliasSet := make(map[string]struct{})
 	for _, ingress := range ingresses.Items {
 		for _, rule := range ingress.Spec.Rules {
-			if strings.HasSuffix(rule.Host, "cern.ch") {
-				alias := strings.TrimSuffix(rule.Host, ".cern.ch")
+			if strings.HasSuffix(rule.Host, internal.CernChSuffix) {
+				alias := strings.TrimSuffix(rule.Host, internal.CernChDomain)
 				aliasSet[alias] = struct{}{}
 			} else {
-				log.Debugf("ingress defined host %s is not cern managed, skipping", rule.Host)
+				log.V(1).Info("Ingress host is not a CERN managed domain, skipping", "host", rule.Host)
 			}
 		}
 	}
@@ -186,30 +187,35 @@ func (c *Controller) listIngressLanDBAliases(ctx context.Context) ([]string, err
 		aliases = append(aliases, alias)
 	}
 	sort.Strings(aliases)
-	log.Infof("desired list of desired landb aliases from cluster ingresses: %v", aliases)
+	log.V(1).Info("Desired aliases from ingresses", "aliases", aliases)
 
 	return aliases, nil
 }
 
-// listIngressNodes returns the names of all nodes labeled as ingress nodes in the cluster.
-// Nodes are sorted alphabetically for deterministic output.
-func (c *Controller) listIngressNodes(ctx context.Context) ([]string, error) {
-	log.Info("obtaining list nodes labeled as ingress")
+// listIngressNodeIPs returns the IP addresses of all nodes labeled as ingress nodes.
+// IPs are sorted alphabetically for deterministic output.
+func (c *Controller) listIngressNodeIPs(ctx context.Context) ([]string, error) {
+	log := log.FromContext(ctx)
+	log.V(1).Info("Listing ingress node IPs")
 	nodes := &v1.NodeList{}
-	if err := c.List(ctx, nodes); err != nil {
+	// Use a label selector to find nodes where the ingress role label *exists*
+	selector := client.MatchingLabels{c.IngressNodeLabel: internal.TrueString}
+	if err := c.List(ctx, nodes, selector); err != nil {
 		return nil, fmt.Errorf("unable to list nodes: %w", err)
 	}
 
-	var ingressNodes []string
-	for _, node := range nodes.Items {
-		if node.Labels["node-role.kubernetes.io/ingress"] == "true" {
-			ingressNodes = append(ingressNodes, node.Name)
-		} else {
-			log.Debugf("node %s not labeled as ingress, skipping", node.Name)
+	var nodeIPs []string
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		ip, err := utils.GetNodeIP(node)
+		if err != nil {
+			log.V(1).Info("Skipping node", "node", node.Name, "error", err)
+			continue
 		}
+		nodeIPs = append(nodeIPs, ip)
 	}
 
-	sort.Strings(ingressNodes) // deterministic order
-	log.Infof("list of nodes labeled as ingress: %v", ingressNodes)
-	return ingressNodes, nil
+	sort.Strings(nodeIPs) // deterministic order
+	log.V(1).Info("Ingress node IPs", "ips", nodeIPs)
+	return nodeIPs, nil
 }

@@ -1,0 +1,16 @@
+image: golang:1.24
+
+stages:
+  - lint
+  - test
+
+lint:
+  stage: lint
+  script:
+    - go fmt ./...
+    - go vet ./...
+
+test:
+  stage: test
+  script:
+    - go test -v ./...
