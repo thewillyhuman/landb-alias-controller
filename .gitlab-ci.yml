@@ -4,6 +4,8 @@ image: "gitlab-registry.cern.ch/linuxsupport/alma9-base"
 stages:
 - "lint"
 - "validate"
+- "build"
+- "tagging"
 
 lint_general:
   stage: "lint"
@@ -55,3 +57,39 @@ test:
   image: "golang:1.24"
   script:
   - "go test -v ./..."
+
+build_image:
+  stage: build
+  variables:
+    TO: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  trigger:
+    include:
+      - project: 'ci-tools/docker-builder'
+        file: '/ci.yml'
+    strategy: depend
+
+tag_docker_image_in_default_branch:
+  stage: tagging
+  image: gitlab-registry.cern.ch/ci-tools/docker-builder/tools
+  variables:
+    GIT_STRATEGY: none
+  dependencies: []
+  script:
+    - source /kaniko/auth.sh
+    - crane tag "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" "${CI_COMMIT_SHORT_SHA}-rc"
+    - crane validate --remote "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}-rc"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+tag_docker_image_with_git_tag:
+  stage: tagging
+  image: gitlab-registry.cern.ch/ci-tools/docker-builder/tools
+  variables:
+    GIT_STRATEGY: none
+  dependencies: []
+  script:
+    - source /kaniko/auth.sh
+    - crane tag "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" "${CI_COMMIT_TAG}"
+    - crane validate --remote "${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}"
+  rules:
+    - if: $CI_COMMIT_TAG
