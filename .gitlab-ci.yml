@@ -9,7 +9,11 @@ lint:
   image: golangci/golangci-lint:latest
   allow_failure: true
   script:
-    - golangci-lint run --config=.golangci.yaml
+    - golangci-lint run --config=.golangci.yaml --output.code-climate.path=gl-code-quality-report.json
+  artifacts:
+    reports:
+      codequality:
+        - gl-code-quality-report.json
 
 test:
   stage: validate
