@@ -1,4 +1,4 @@
-# Kubernetes Alias Controller
+# Kubernetes LanDB Alias Controller
 
 The `kubernetes-alias-controller` is a Kubernetes controller that automatically manages DNS aliases based on Kubernetes Ingress resources. It monitors Ingress objects in a Kubernetes cluster and ensures that the corresponding DNS records are correctly configured in the configured DNS provider.
 
