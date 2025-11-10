@@ -402,7 +402,7 @@ func (p *Provider) Reconcile(changes *plan.Changes) error {
 		}
 
 		// Build this node's desired metadata map
-		suffix := fmt.Sprintf("--load%d-", i)
+		suffix := fmt.Sprintf("--load-%d-", i)
 		normalizedAliases := desiredNodeAliases[nodeName]
 
 		suffixedAliases := make([]string, len(normalizedAliases))
