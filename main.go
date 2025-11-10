@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal/log"
 	"os"
 
 	"gitlab.cern.ch/gfacundo/landb-alias-controller/controller"
@@ -13,42 +15,36 @@ import (
 	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
 	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider/openstack"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
 	// scheme is the Kubernetes scheme.
 	scheme = runtime.NewScheme()
-	// setupLog is the logger for the setup.
-	setupLog = ctrl.Log.WithName("setup")
 )
 
 func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(networkingv1.AddToScheme(scheme))
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme)) // Pods, Services, Deployments, ConfigMaps, Secrets, etc..
+	utilruntime.Must(networkingv1.AddToScheme(scheme))   // Ingresses and NetworkPolicies.
 	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
 // main is the main entry point of the application.
 func main() {
+	log.GlobalLogger = log.NewLogger(log.DefaultLogLevel)
+	log.GlobalLogger.Info("starting landb alias controller")
 	if err := Run(); err != nil {
-		setupLog.Error(err, "problem running manager")
+		log.GlobalLogger.Error("startup failed")
 		os.Exit(1)
 	}
 }
@@ -56,43 +52,33 @@ func main() {
 // Run is the main logic of the application. It is responsible for parsing flags,
 // initializing the manager, and setting up the controller.
 func Run() error {
-	var metricsAddr string
-	var enableLeaderElection bool
-	var probeAddr string
 	var providerName string
 	var ingressNodeLabel string
 	var logLevel string
 
 	// --- General Flags ---
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
 	flag.StringVar(&providerName, "provider", internal.ProviderOpenStack, "The DNS provider to use (e.g., 'openstack').")
 	flag.StringVar(&ingressNodeLabel, "ingress-node-label", internal.IngressNodeLabelDefault, "The label to use for selecting ingress nodes.")
 	flag.StringVar(&logLevel, "log-level", "info", "The log level to use (e.g., 'debug', 'info', 'warn', 'error').")
-
 	flag.Parse()
-	configureLogging(logLevel)
 
-	leaderElectionID, err := randomHex(8)
-	if err != nil {
-		return err
+	// --- Set the logger ---
+	level, exists := log.LevelFromString(logLevel)
+	if !exists {
+		log.GlobalLogger.Warn("invalid log level [%s]. Continuing with default log level [%s]", logLevel, log.LevelNames[log.DefaultLogLevel])
+		log.GlobalLogger = log.NewLogger(log.DefaultLogLevel)
+	} else {
+		log.GlobalLogger.Info("setting log level to [%s]", logLevel)
+		log.GlobalLogger = log.NewLogger(level)
 	}
 
+	// -- Init kubernetes runtime control manager ---
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                server.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       leaderElectionID,
+		Scheme: scheme,
 	})
 	if err != nil {
-		return err
-	}
-
-	if err := addHealthChecks(mgr); err != nil {
+		log.GlobalLogger.Debug("error %v", err)
+		log.GlobalLogger.Error("unable to start kubernetes runtime control manager")
 		return err
 	}
 
@@ -101,23 +87,19 @@ func Run() error {
 	// from environment variables (e.g., OS_AUTH_URL).
 	dnsProvider, err := initProvider(providerName, mgr)
 	if err != nil {
-		return fmt.Errorf("failed to initialize provider: %w", err)
-	}
-
-	// Defer password zeroing if the provider supports it.
-	// This is interface-based, so main doesn't need to know *what*
-	// provider it is, only that it *might* have this method.
-	if z, ok := dnsProvider.(interface{ ZeroPassword() }); ok {
-		setupLog.Info("registering provider password zeroing on exit")
-		defer z.ZeroPassword()
+		log.GlobalLogger.Debug("error: %v", err)
+		log.GlobalLogger.Error("failed to initialize dns provider [%s]", providerName)
+		return errors.New("failed to initialize dns provider")
 	}
 
 	// --- Setup Controller ---
 	if err := setupController(mgr, dnsProvider, ingressNodeLabel); err != nil {
+		log.GlobalLogger.Debug("error: %v", err)
+		log.GlobalLogger.Error("failed to setup controller")
 		return err
 	}
 
-	setupLog.Info("starting manager")
+	log.GlobalLogger.Info("starting resources watcher")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
@@ -125,7 +107,7 @@ func Run() error {
 func initProvider(providerName string, mgr ctrl.Manager) (provider.Provider, error) {
 	switch providerName {
 	case internal.ProviderOpenStack:
-		setupLog.V(1).Info("using openstack provider")
+		log.GlobalLogger.Info("using dns provider: openstack")
 		// The openstack.NewProvider function will read its configuration
 		// directly from environment variables (OS_AUTH_URL, OS_PASSWORD, etc.)
 		return openstack.NewProvider(mgr.GetClient())
@@ -137,39 +119,8 @@ func initProvider(providerName string, mgr ctrl.Manager) (provider.Provider, err
 	//    return cloudflare.NewProvider(...)
 
 	default:
-		return nil, fmt.Errorf("unsupported provider %q", providerName)
+		return nil, errors.New(fmt.Sprintf("provider [%s] did not match any of registered dns providers", providerName))
 	}
-}
-
-// configureLogging configures the logging for the application.
-func configureLogging(logLevel string) {
-	var level zapcore.Level
-	if err := level.UnmarshalText([]byte(logLevel)); err != nil {
-		setupLog.Error(err, "invalid log level, defaulting to info", "logLevel", logLevel)
-		level = zapcore.InfoLevel
-	}
-
-	atomicLevel := zap.NewAtomicLevel()
-	atomicLevel.SetLevel(level)
-
-	opts := ctrlzap.Options{
-		Development: true,
-		Level:       &atomicLevel,
-	}
-	opts.BindFlags(flag.CommandLine)
-
-	ctrl.SetLogger(ctrlzap.New(ctrlzap.UseFlagOptions(&opts)))
-}
-
-// addHealthChecks adds health checks to the manager.
-func addHealthChecks(mgr ctrl.Manager) error {
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		return err
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		return err
-	}
-	return nil
 }
 
 // setupController sets up the controller with the manager.
@@ -195,12 +146,12 @@ func setupController(mgr ctrl.Manager, dnsProvider provider.Provider, ingressNod
 			c := mgr.GetClient()
 			ingressList := &networkingv1.IngressList{}
 			if err := c.List(ctx, ingressList, client.Limit(1)); err != nil {
-				setupLog.Error(err, "failed to list ingresses for node watch handler")
+				log.GlobalLogger.Error("failed to list ingresses for node watch handler")
 				return nil
 			}
 
 			if len(ingressList.Items) == 0 {
-				setupLog.V(1).Info("Node changed, but no ingresses found to trigger reconcile.")
+				log.GlobalLogger.Info("Node changed, but no ingresses found to trigger reconcile")
 				return nil // No ingresses to trigger
 			}
 
@@ -210,7 +161,7 @@ func setupController(mgr ctrl.Manager, dnsProvider provider.Provider, ingressNod
 					Namespace: ingressList.Items[0].Namespace,
 				},
 			}
-			setupLog.V(1).Info("Ingress node changed, enqueuing dummy request for ingress to trigger full reconcile", "node", node.GetName(), "ingress", req.NamespacedName)
+			log.GlobalLogger.Info("Ingress node changed, enqueuing dummy request for ingress to trigger full reconcile", "node", node.GetName(), "ingress", req.NamespacedName)
 			return []reconcile.Request{req}
 		},
 	)
