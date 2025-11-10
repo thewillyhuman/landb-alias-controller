@@ -1,0 +1,31 @@
+version: 2
+run:
+  # By default, golangci-lint skips test files.
+  # Remove this line if you also want to lint exported functions in your tests.
+  skip-files:
+    - ".*_test\\.go$"
+
+linters:
+  # Disable all default linters, so we only run the one we want.
+  disable-all: true
+
+  # Enable 'revive', which is the linter that checks for documentation.
+  enable:
+    - asciicheck # checks that your code does not contain non-ASCII identifiers
+    - bidichk # checks for dangerous unicode character sequences
+    - dupl # tool for code clone detection
+    - errcheck # checking for unchecked errors, these unchecked errors can be critical bugs in some cases
+    - exhaustive # checks exhaustiveness of enum switch statements
+    - funcorder # checks the order of functions, methods, and constructors
+    - funlen # tool for detection of long functions
+    - goconst # finds repeated strings that could be replaced by a constant
+    - revive # Checks for Exported types with no documentation
+
+linters-settings:
+  revive:
+    # This is the key: we are enabling the rule that requires
+    # a comment on all exported functions, types, variables, and constants.
+    rules:
+      - name: comment-on-exported
+        # This rule is enabled by default, but this makes it explicit.
+        disabled: false

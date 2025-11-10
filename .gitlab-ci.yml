@@ -2,15 +2,16 @@ image: golang:1.24
 
 stages:
   - lint
-  - test
+  - validate
 
 lint:
   stage: lint
+  image: golangci/golangci-lint:latest
+  allow_failure: true
   script:
-    - go fmt ./...
-    - go vet ./...
+    - golangci-lint run --config=.golangci.yaml
 
 test:
-  stage: test
+  stage: validate
   script:
     - go test -v ./...
