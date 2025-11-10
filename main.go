@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -176,13 +174,4 @@ func setupController(mgr ctrl.Manager, dnsProvider provider.Provider, ingressNod
 			DnsProvider:      dnsProvider,
 			IngressNodeLabel: ingressNodeLabel,
 		})
-}
-
-// randomHex generates a random hex string of the given length.
-func randomHex(n int) (string, error) {
-	bytes := make([]byte, n)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes), nil
 }
