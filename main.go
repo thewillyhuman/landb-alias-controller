@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,14 +15,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
@@ -109,13 +104,6 @@ func initProvider(providerName string, mgr ctrl.Manager) (provider.Provider, err
 		// The openstack.NewProvider function will read its configuration
 		// directly from environment variables (OS_AUTH_URL, OS_PASSWORD, etc.)
 		return openstack.NewProvider(mgr.GetClient())
-
-	// --- Future Providers ---
-	// case "route53":
-	//    return route53.NewProvider(...)
-	// case "cloudflare":
-	//    return cloudflare.NewProvider(...)
-
 	default:
 		return nil, errors.New(fmt.Sprintf("provider [%s] did not match any of registered dns providers", providerName))
 	}
@@ -123,52 +111,11 @@ func initProvider(providerName string, mgr ctrl.Manager) (provider.Provider, err
 
 // setupController sets up the controller with the manager.
 func setupController(mgr ctrl.Manager, dnsProvider provider.Provider, ingressNodeLabel string) error {
-	// A change to *any* Ingress node (e.g., IP change, label added/removed)
-	// requires a full reconciliation, as it affects the IP list for *all* aliases.
-	nodeHandler := handler.EnqueueRequestsFromMapFunc(
-		func(ctx context.Context, node client.Object) []reconcile.Request {
-			// Check if it's an ingress node
-			labels := node.GetLabels()
-			if _, ok := labels[ingressNodeLabel]; !ok {
-				// We also check for the "true" value, just in case.
-				// The selector in the controller is for label existence.
-				if val, ok := labels[ingressNodeLabel]; !ok || val != internal.TrueString {
-					return nil // Not an ingress node, ignore.
-				}
-			}
-
-			// Ingress node changed. We must trigger a full resync.
-			// The controller's Reconcile() ignores the request details, so we
-			// can just find the *first* Ingress and enqueue a request for it
-			// to "poke" the controller.
-			c := mgr.GetClient()
-			ingressList := &networkingv1.IngressList{}
-			if err := c.List(ctx, ingressList, client.Limit(1)); err != nil {
-				log.GlobalLogger.Error("failed to list ingresses for node watch handler")
-				return nil
-			}
-
-			if len(ingressList.Items) == 0 {
-				log.GlobalLogger.Info("Node changed, but no ingresses found to trigger reconcile")
-				return nil // No ingresses to trigger
-			}
-
-			req := reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      ingressList.Items[0].Name,
-					Namespace: ingressList.Items[0].Namespace,
-				},
-			}
-			log.GlobalLogger.Info("Ingress node changed, enqueuing dummy request for ingress to trigger full reconcile", "node", node.GetName(), "ingress", req.NamespacedName)
-			return []reconcile.Request{req}
-		},
-	)
-
 	return builder.ControllerManagedBy(mgr).
 		// Watch for changes to Ingress resources
 		For(&networkingv1.Ingress{}).
-		// Also watch for changes to Nodes, and trigger Ingress reconciles
-		Watches(&corev1.Node{}, nodeHandler).
+		For(&corev1.Service{}).
+		For(&corev1.Node{}).
 		Complete(&controller.Controller{
 			Client:           mgr.GetClient(),
 			DnsProvider:      dnsProvider,
