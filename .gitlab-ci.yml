@@ -1,21 +1,57 @@
-image: golang:1.24
+---
+image: "gitlab-registry.cern.ch/linuxsupport/alma9-base"
 
 stages:
-  - lint
-  - validate
+- "lint"
+- "validate"
 
-lint:
-  stage: lint
-  image: golangci/golangci-lint:latest
+lint_general:
+  stage: "lint"
+  image: "golang:1.24"
   allow_failure: true
   script:
-    - golangci-lint run --config=.golangci.yaml --output.code-climate.path=gl-code-quality-report.json
+  - "go install
+    github.com/editorconfig-checker/editorconfig-checker/v3/cmd/editorconfig-checker@latest"
+  - "editorconfig-checker ."
+
+lint_go_style:
+  stage: "lint"
+  image: "golangci/golangci-lint:latest"
+  allow_failure: true
   artifacts:
     reports:
       codequality:
-        - gl-code-quality-report.json
+      - "gl-code-quality-report.json"
+  script:
+  - "golangci-lint run --config=.golangci.yaml
+    --output.code-climate.path=gl-code-quality-report.json"
+
+lint_markdown_style:
+  stage: "lint"
+  image: "node:20"
+  allow_failure: true
+  script:
+  - "npm install -g markdownlint-cli"
+  - "markdownlint \"**/*.md\""
+
+lint_markdown_spell:
+  stage: "lint"
+  image: "node:20"
+  allow_failure: true
+  script:
+  - "npm install -g cspell"
+  - "cspell \"**/*.md\""
+
+lint_yaml_style:
+  stage: "lint"
+  allow_failure: true
+  script:
+  - "dnf install -y epel-release"
+  - "dnf install -y yamllint"
+  - "yamllint ."
 
 test:
-  stage: validate
+  stage: "validate"
+  image: "golang:1.24"
   script:
-    - go test -v ./...
+  - "go test -v ./..."
