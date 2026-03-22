@@ -1,68 +1,55 @@
+// Package provider defines the interface that DNS alias providers must
+// implement, along with the data types used to describe the desired state.
+//
+// The controller builds an AliasSet from Kubernetes Ingress and Node
+// resources and passes it to the provider's Sync method. The provider
+// is responsible for reading the current infrastructure state, computing
+// the diff, and applying the necessary changes.
 package provider
 
-import (
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/dns"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/plan" // Added import
-)
+import "context"
 
-// Provider defines the interface that any DNS provider implementation must
-// satisfy.
+// NodeInfo holds the identifying information for a single Kubernetes node
+// that participates in ingress traffic.
+type NodeInfo struct {
+	// Name is the Kubernetes node name, which must match the OpenStack
+	// server name so the provider can locate the corresponding instance.
+	Name string
+
+	// IP is the node's routable IP address (ExternalIP preferred,
+	// InternalIP as fallback).
+	IP string
+}
+
+// AliasSet represents the complete desired state of DNS aliases.
 //
-// A DNS provider is any system capable of managing DNS records for one or more
-// zones. The Provider interface is designed to be **provider-agnostic**,
-// meaning implementations can target AWS Route53, Cloudflare, GCP Cloud DNS,
-// on-prem DNS servers, or any other system capable of storing and serving DNS
-// records.
+// Aliases are the base names (e.g., "myapp") extracted from Ingress hosts
+// after stripping the ".cern.ch" suffix. Nodes are the ingress-labeled
+// Kubernetes nodes, sorted alphabetically by name. The node's position
+// in the slice determines its load-balancer suffix (--load-N-).
+type AliasSet struct {
+	// Aliases is a sorted, deduplicated list of alias names.
+	Aliases []string
+
+	// Nodes is the ordered list of ingress nodes. The index in this
+	// slice determines the --load-N- suffix assigned to each node.
+	Nodes []NodeInfo
+}
+
+// Provider defines the contract that any DNS alias backend must satisfy.
 //
-// Implementations of this interface are expected to operate with the generic
-// dns.Record type defined in the dns package.
-//
-// Error Handling:
-//   - If any operation fails (e.g., network errors, permission errors,
-//     validation errors, provider-specific API errors), the methods should
-//     return a **non-nil error**.
-//   - Implementations should wrap provider-specific errors with context so that
-//     callers can identify the source of the failure.
-//
-// Thread Safety:
-//   - Implementations should document whether they are safe for concurrent use.
+// Implementations are expected to be safe for sequential use within a
+// single reconciliation loop. Concurrent use is not required.
 type Provider interface {
-	// Records retrieves the current DNS records from the provider.
+	// Sync reconciles the infrastructure to match the desired AliasSet.
 	//
-	// Returns:
-	//   - []*dns.Record: slice of pointers to dns.Record representing the current
-	//     state of DNS records managed by this provider.
-	//   - error: non-nil if the operation fails. Errors may be network errors,
-	//     provider API errors, authentication errors, or validation errors.
+	// The implementation should:
+	//  1. For each node, compute the desired metadata from aliases + node index.
+	//  2. Read the current metadata from the infrastructure.
+	//  3. Diff and apply only the necessary changes.
+	//  4. Return a non-nil error if any operation fails.
 	//
-	// Notes:
-	//   - Records returned should be fully populated, including Name, Type, TTL,
-	//     Values, and any optional fields such as Priority, Weight, Port,
-	//     Provider, ProviderID, Meta.
-	Records() ([]*dns.Record, error)
-
-	// Reconcile applies a calculated set of changes to the provider's
-	// DNS records.
-	//
-	// This method is responsible for executing the actions defined in the
-	// plan.Changes struct: creating, updating, and deleting records
-	// as specified.
-	//
-	// Parameters:
-	//   - changes: A pointer to the plan.Changes struct containing the
-	//     lists of records to create, update, and delete.
-	//
-	// Returns:
-	//   - error: non-nil if any of the create, update, or delete
-	//     operations fail.
-	//
-	// Notes:
-	//   - Implementations should aim to execute the changes as efficiently
-	//     as possible, using batch operations if the provider's API
-	//     supports them.
-	//   - If the provider API supports partial success (e.g., 2 of 3
-	//     deletes succeed), the implementation should decide whether to
-	//     return an error. Returning an error is recommended if any
-	//     part of the plan fails to apply.
-	Reconcile(changes *plan.Changes) error
+	// Partial failures should be aggregated (e.g., via errors.Join) so that
+	// all nodes are attempted even if some fail.
+	Sync(ctx context.Context, desired AliasSet) error
 }

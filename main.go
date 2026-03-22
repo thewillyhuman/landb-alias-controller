@@ -1,124 +1,153 @@
+// Package main is the entry point of the landb-alias-controller.
+//
+// The controller watches Kubernetes Ingress and Node resources, extracts
+// CERN DNS aliases from Ingress hosts, and synchronizes them as metadata
+// on OpenStack servers so that CERN's LANDB system can update DNS records.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal/log"
 	"os"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/controller"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider/openstack"
-
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/controller"
+	_ "gitlab.cern.ch/gfacundo/landb-alias-controller/metrics" // Register metrics on init.
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider/openstack"
 )
 
-var (
-	// scheme is the Kubernetes scheme.
-	scheme = runtime.NewScheme()
+const (
+	// providerOpenStack is the identifier for the OpenStack LANDB provider.
+	providerOpenStack = "openstack"
+	// defaultIngressNodeLabel is the Kubernetes label used to identify
+	// nodes serving ingress traffic.
+	defaultIngressNodeLabel = "node-role.kubernetes.io/ingress"
 )
+
+var scheme = runtime.NewScheme()
 
 func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme)) // Pods, Services, Deployments, ConfigMaps, Secrets, etc..
-	utilruntime.Must(networkingv1.AddToScheme(scheme))   // Ingresses and NetworkPolicies.
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(networkingv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
-// main is the main entry point of the application.
 func main() {
-	log.GlobalLogger = log.NewLogger(log.DefaultLogLevel)
-	log.GlobalLogger.Info("starting landb alias controller")
-	if err := Run(); err != nil {
-		log.GlobalLogger.Error("startup failed")
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// Run is the main logic of the application. It is responsible for parsing flags,
-// initializing the manager, and setting up the controller.
-func Run() error {
-	var providerName string
-	var ingressNodeLabel string
-	var logLevel string
+// run contains the application logic, separated from main for testability.
+func run() error {
+	// --- Flags ---
+	var (
+		providerName     string
+		ingressNodeLabel string
+	)
+	flag.StringVar(&providerName, "provider", providerOpenStack,
+		"DNS provider to use (currently only 'openstack').")
+	flag.StringVar(&ingressNodeLabel, "ingress-node-label", defaultIngressNodeLabel,
+		"Kubernetes label identifying ingress nodes.")
 
-	// --- General Flags ---
-	flag.StringVar(&providerName, "provider", internal.ProviderOpenStack, "The DNS provider to use (e.g., 'openstack').")
-	flag.StringVar(&ingressNodeLabel, "ingress-node-label", internal.IngressNodeLabelDefault, "The label to use for selecting ingress nodes.")
-	flag.StringVar(&logLevel, "log-level", "info", "The log level to use (e.g., 'debug', 'info', 'warn', 'error').")
+	// controller-runtime's zap flag set (--zap-log-level, --zap-devel, etc.)
+	zapOpts := zap.Options{}
+	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	// --- Set the logger ---
-	level, exists := log.LevelFromString(logLevel)
-	if !exists {
-		log.GlobalLogger.Warn("invalid log level [%s]. Continuing with default log level [%s]", logLevel, log.LevelNames[log.DefaultLogLevel])
-		log.GlobalLogger = log.NewLogger(log.DefaultLogLevel)
-	} else {
-		log.GlobalLogger.Info("setting log level to [%s]", logLevel)
-		log.GlobalLogger = log.NewLogger(level)
-	}
+	// --- Logger ---
+	logger := zap.New(zap.UseFlagOptions(&zapOpts))
+	ctrl.SetLogger(logger)
+	log := ctrl.Log.WithName("setup")
 
-	// -- Init kubernetes runtime control manager ---
+	log.Info("Starting landb-alias-controller",
+		"provider", providerName,
+		"ingressNodeLabel", ingressNodeLabel,
+	)
+
+	// --- Controller Manager ---
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 	})
 	if err != nil {
-		log.GlobalLogger.Debug("error %v", err)
-		log.GlobalLogger.Error("unable to start kubernetes runtime control manager")
-		return err
+		return fmt.Errorf("creating manager: %w", err)
 	}
 
-	// --- Initialize Provider ---
-	// The provider implementation is expected to read its own configuration
-	// from environment variables (e.g., OS_AUTH_URL).
-	dnsProvider, err := initProvider(providerName, mgr)
+	// --- Provider ---
+	dnsProvider, err := initProvider(providerName, ctrl.Log)
 	if err != nil {
-		log.GlobalLogger.Debug("error: %v", err)
-		log.GlobalLogger.Error("failed to initialize dns provider [%s]", providerName)
-		return errors.New("failed to initialize dns provider")
+		return fmt.Errorf("initializing provider: %w", err)
 	}
 
-	// --- Setup Controller ---
+	// --- Controller Setup ---
 	if err := setupController(mgr, dnsProvider, ingressNodeLabel); err != nil {
-		log.GlobalLogger.Debug("error: %v", err)
-		log.GlobalLogger.Error("failed to setup controller")
-		return err
+		return fmt.Errorf("setting up controller: %w", err)
 	}
 
-	log.GlobalLogger.Info("starting resources watcher")
+	log.Info("Starting manager")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
-// initProvider acts as a factory for creating the specified DNS provider.
-func initProvider(providerName string, mgr ctrl.Manager) (provider.Provider, error) {
-	switch providerName {
-	case internal.ProviderOpenStack:
-		log.GlobalLogger.Info("using dns provider: openstack")
-		// The openstack.NewProvider function will read its configuration
-		// directly from environment variables (OS_AUTH_URL, OS_PASSWORD, etc.)
-		return openstack.NewProvider(mgr.GetClient())
+// initProvider creates the configured DNS alias provider.
+func initProvider(name string, log logr.Logger) (provider.Provider, error) {
+	switch name {
+	case providerOpenStack:
+		return openstack.NewProvider(log)
 	default:
-		return nil, errors.New(fmt.Sprintf("provider [%s] did not match any of registered dns providers", providerName))
+		return nil, errors.New(fmt.Sprintf("unknown provider %q; supported: %s", name, providerOpenStack))
 	}
 }
 
-// setupController sets up the controller with the manager.
-func setupController(mgr ctrl.Manager, dnsProvider provider.Provider, ingressNodeLabel string) error {
+// setupController registers the reconciler and configures watches for
+// Ingress and Node resources.
+func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel string) error {
+	reconciler := &controller.Controller{
+		Client:           mgr.GetClient(),
+		Provider:         prov,
+		IngressNodeLabel: ingressNodeLabel,
+	}
+
+	// labelPredicate filters Node events to only those that have (or had)
+	// the ingress node label. This prevents spurious reconciliations from
+	// unrelated node changes.
+	labelPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		_, hasLabel := obj.GetLabels()[ingressNodeLabel]
+		return hasLabel
+	})
+
 	return builder.ControllerManagedBy(mgr).
-		// Watch for changes to Ingress resources
+		// Reconcile on any Ingress change across all namespaces.
 		For(&networkingv1.Ingress{}).
-		For(&corev1.Service{}).
-		For(&corev1.Node{}).
-		Complete(&controller.Controller{
-			Client:           mgr.GetClient(),
-			DnsProvider:      dnsProvider,
-			IngressNodeLabel: ingressNodeLabel,
-		})
+		// Reconcile on changes to ingress-labeled Nodes. All node events
+		// map to the same reconcile key to avoid thundering herd when
+		// multiple nodes change simultaneously.
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(
+				func(_ context.Context, _ client.Object) []reconcile.Request {
+					return []reconcile.Request{{
+						NamespacedName: types.NamespacedName{Name: "landb-alias-reconcile"},
+					}}
+				},
+			),
+			builder.WithPredicates(labelPredicate),
+		).
+		Complete(reconciler)
 }

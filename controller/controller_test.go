@@ -2,287 +2,264 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/dns"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/plan"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
-	corev1 "k8s.io/api/core/v1"
+
+	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
 )
 
-// mockProvider is a mock implementation of the provider.Provider interface.
+// --- mockProvider: test double for provider.Provider ---
+
 type mockProvider struct {
-	records      []*dns.Record
-	reconcileErr error
-	recordsErr   error
+	lastDesired *provider.AliasSet
+	syncErr     error
 }
 
-// Records returns the mock records.
-func (m *mockProvider) Records() ([]*dns.Record, error) {
-	if m.recordsErr != nil {
-		return nil, m.recordsErr
-	}
-	return m.records, nil
+func (m *mockProvider) Sync(_ context.Context, desired provider.AliasSet) error {
+	m.lastDesired = &desired
+	return m.syncErr
 }
 
-// Reconcile is a mock implementation of the Reconcile method.
-func (m *mockProvider) Reconcile(changes *plan.Changes) error {
-	if m.reconcileErr != nil {
-		return m.reconcileErr
-	}
-	return nil
-}
+// --- helpers ---
 
-// newTestController creates a new controller for testing.
-func newTestController(provider provider.Provider, objs ...runtime.Object) *Controller {
+func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
-	corev1.AddToScheme(s)
-	networkingv1.AddToScheme(s)
-	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).Build()
-	return &Controller{
-		Client:           cl,
-		DnsProvider:      provider,
-		IngressNodeLabel: internal.IngressNodeLabelDefault,
-		Interval:         1 * time.Minute,
-	}
+	_ = v1.AddToScheme(s)
+	_ = networkingv1.AddToScheme(s)
+	return s
 }
 
-// TestReconcile tests the Reconcile method of the controller.
-func TestReconcile(t *testing.T) {
-	// Create a mock provider.
-	provider := &mockProvider{
-		records: []*dns.Record{
-			{
-				Name:   "foo",
-				Type:   "A",
-				Values: []string{"1.1.1.1"},
-			},
-		},
-	}
-
-	// Create a fake Kubernetes client.
-	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "foo-ingress",
-			Namespace: "default",
-		},
+func makeIngress(name, namespace, host string) *networkingv1.Ingress {
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: networkingv1.IngressSpec{
 			Rules: []networkingv1.IngressRule{
-				{
-					Host: "foo.cern.ch",
-				},
+				{Host: host},
 			},
 		},
 	}
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "node1",
-			Labels: map[string]string{
-				internal.IngressNodeLabelDefault: internal.TrueString,
-			},
-		},
-		Status: corev1.NodeStatus{
-			Addresses: []corev1.NodeAddress{
-				{
-					Type:    corev1.NodeExternalIP,
-					Address: "1.1.1.1",
-				},
-			},
-		},
-	}
-
-	// Create a new controller.
-	c := newTestController(provider, ingress, node)
-
-	// Call the Reconcile method.
-	_, err := c.Reconcile(context.Background(), newTestRequest("foo-ingress", "default"))
-	require.NoError(t, err)
 }
 
-// TestReconcile_NoIngresses tests the Reconcile method of the controller when no ingresses are found.
-func TestReconcile_NoIngresses(t *testing.T) {
-	// Create a mock provider.
-	provider := &mockProvider{
-		records: []*dns.Record{
-			{
-				Name:   "foo",
-				Type:   "A",
-				Values: []string{"1.1.1.1"},
-			},
-		},
+func makeNode(name string, labels map[string]string, externalIP, internalIP string) *v1.Node {
+	var addresses []v1.NodeAddress
+	if externalIP != "" {
+		addresses = append(addresses, v1.NodeAddress{Type: v1.NodeExternalIP, Address: externalIP})
 	}
-
-	// Create a fake Kubernetes client.
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "node1",
-			Labels: map[string]string{
-				internal.IngressNodeLabelDefault: internal.TrueString,
-			},
-		},
-		Status: corev1.NodeStatus{
-			Addresses: []corev1.NodeAddress{
-				{
-					Type:    corev1.NodeExternalIP,
-					Address: "1.1.1.1",
-				},
-			},
-		},
+	if internalIP != "" {
+		addresses = append(addresses, v1.NodeAddress{Type: v1.NodeInternalIP, Address: internalIP})
 	}
-
-	// Create a new controller.
-	c := newTestController(provider, node)
-
-	// Call the Reconcile method.
-	_, err := c.Reconcile(context.Background(), newTestRequest("foo-ingress", "default"))
-	require.NoError(t, err)
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Status:     v1.NodeStatus{Addresses: addresses},
+	}
 }
 
-// TestReconcile_NoNodes tests the Reconcile method of the controller when no nodes are found.
-func TestReconcile_NoNodes(t *testing.T) {
-	// Create a mock provider.
-	provider := &mockProvider{
-		records: []*dns.Record{
-			{
-				Name:   "foo",
-				Type:   "A",
-				Values: []string{"1.1.1.1"},
-			},
-		},
-	}
+// --- listAliases tests ---
 
-	// Create a fake Kubernetes client.
+func TestListAliases_ExtractsCernHosts(t *testing.T) {
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app1.cern.ch"),
+		makeIngress("ing-2", "default", "app2.cern.ch"),
+		makeIngress("ing-3", "other", "external.example.com"),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: "node-role.kubernetes.io/ingress"}
+	aliases, err := c.listAliases(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"app1", "app2"}, aliases)
+}
+
+func TestListAliases_DeduplicatesHosts(t *testing.T) {
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		makeIngress("ing-2", "other", "app.cern.ch"),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: "node-role.kubernetes.io/ingress"}
+	aliases, err := c.listAliases(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"app"}, aliases)
+}
+
+func TestListAliases_NoIngresses(t *testing.T) {
+	client := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: "node-role.kubernetes.io/ingress"}
+	aliases, err := c.listAliases(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, aliases)
+}
+
+func TestListAliases_SkipsNonCernHosts(t *testing.T) {
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.example.com"),
+		makeIngress("ing-2", "default", "app.cern.ch"),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: "node-role.kubernetes.io/ingress"}
+	aliases, err := c.listAliases(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"app"}, aliases)
+}
+
+func TestListAliases_MultipleRulesPerIngress(t *testing.T) {
 	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "foo-ingress",
-			Namespace: "default",
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default"},
 		Spec: networkingv1.IngressSpec{
 			Rules: []networkingv1.IngressRule{
-				{
-					Host: "foo.cern.ch",
-				},
+				{Host: "app1.cern.ch"},
+				{Host: "app2.cern.ch"},
+				{Host: "external.io"},
 			},
 		},
 	}
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(ingress).Build()
 
-	// Create a new controller.
-	c := newTestController(provider, ingress)
-
-	// Call the Reconcile method.
-	_, err := c.Reconcile(context.Background(), newTestRequest("foo-ingress", "default"))
+	c := &Controller{Client: client, IngressNodeLabel: "node-role.kubernetes.io/ingress"}
+	aliases, err := c.listAliases(context.Background())
 	require.NoError(t, err)
+	assert.Equal(t, []string{"app1", "app2"}, aliases)
 }
 
-// TestReconcile_ProviderGetRecordsError tests the Reconcile method of the controller when the provider returns an error when getting records.
-func TestReconcile_ProviderGetRecordsError(t *testing.T) {
-	// Create a mock provider.
-	provider := &mockProvider{
-		recordsErr: assert.AnError,
-	}
+// --- listNodes tests ---
 
-	// Create a fake Kubernetes client.
-	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "foo-ingress",
-			Namespace: "default",
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: "foo.cern.ch",
-				},
-			},
-		},
-	}
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "node1",
-			Labels: map[string]string{
-				internal.IngressNodeLabelDefault: internal.TrueString,
-			},
-		},
-		Status: corev1.NodeStatus{
-			Addresses: []corev1.NodeAddress{
-				{
-					Type:    corev1.NodeExternalIP,
-					Address: "1.1.1.1",
-				},
-			},
-		},
-	}
+func TestListNodes_FiltersAndSortsByName(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", "10.0.0.2"),
+		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", "10.0.0.1"),
+		makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", "10.0.0.3"),
+	).Build()
 
-	// Create a new controller.
-	c := newTestController(provider, ingress, node)
+	c := &Controller{Client: client, IngressNodeLabel: label}
+	nodes, err := c.listNodes(context.Background())
+	require.NoError(t, err)
 
-	// Call the Reconcile method.
-	_, err := c.Reconcile(context.Background(), newTestRequest("foo-ingress", "default"))
+	require.Len(t, nodes, 2)
+	assert.Equal(t, "node-a", nodes[0].Name)
+	assert.Equal(t, "1.1.1.1", nodes[0].IP) // Prefers ExternalIP.
+	assert.Equal(t, "node-b", nodes[1].Name)
+	assert.Equal(t, "2.2.2.2", nodes[1].IP)
+}
+
+func TestListNodes_FallsBackToInternalIP(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeNode("node-a", map[string]string{label: ""}, "", "10.0.0.1"),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: label}
+	nodes, err := c.listNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "10.0.0.1", nodes[0].IP)
+}
+
+func TestListNodes_SkipsNodesWithoutIP(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeNode("node-a", map[string]string{label: ""}, "", ""),
+		makeNode("node-b", map[string]string{label: ""}, "1.1.1.1", ""),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: label}
+	nodes, err := c.listNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "node-b", nodes[0].Name)
+}
+
+// --- getNodeIP tests ---
+
+func TestGetNodeIP_PrefersExternal(t *testing.T) {
+	node := makeNode("n", nil, "1.2.3.4", "10.0.0.1")
+	ip, err := getNodeIP(node)
+	require.NoError(t, err)
+	assert.Equal(t, "1.2.3.4", ip)
+}
+
+func TestGetNodeIP_FallsBackToInternal(t *testing.T) {
+	node := makeNode("n", nil, "", "10.0.0.1")
+	ip, err := getNodeIP(node)
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.1", ip)
+}
+
+func TestGetNodeIP_ErrorWhenNoIP(t *testing.T) {
+	node := makeNode("n", nil, "", "")
+	_, err := getNodeIP(node)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no ExternalIP or InternalIP")
 }
 
-// TestReconcile_ProviderReconcileError tests the Reconcile method of the controller when the provider returns an error when reconciling.
-func TestReconcile_ProviderReconcileError(t *testing.T) {
-	// Create a mock provider.
-	provider := &mockProvider{
-		records:      []*dns.Record{},
-		reconcileErr: assert.AnError,
+// --- runOnce integration test ---
+
+func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app1.cern.ch"),
+		makeIngress("ing-2", "default", "app2.cern.ch"),
+		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
+		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: label,
 	}
 
-	// Create a fake Kubernetes client.
-	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "foo-ingress",
-			Namespace: "default",
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: "foo.cern.ch",
-				},
-			},
-		},
-	}
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "node1",
-			Labels: map[string]string{
-				internal.IngressNodeLabelDefault: internal.TrueString,
-			},
-		},
-		Status: corev1.NodeStatus{
-			Addresses: []corev1.NodeAddress{
-				{
-					Type:    corev1.NodeExternalIP,
-					Address: "1.1.1.1",
-				},
-			},
-		},
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+
+	require.NotNil(t, mock.lastDesired)
+	assert.Equal(t, []string{"app1", "app2"}, mock.lastDesired.Aliases)
+	require.Len(t, mock.lastDesired.Nodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name) // Sorted.
+	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
+}
+
+func TestRunOnce_PropagatesProviderError(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+	).Build()
+
+	mock := &mockProvider{syncErr: errors.New("sync failed")}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: label,
 	}
 
-	// Create a new controller.
-	c := newTestController(provider, ingress, node)
-
-	// Call the Reconcile method.
-	_, err := c.Reconcile(context.Background(), newTestRequest("foo-ingress", "default"))
+	err := c.runOnce(context.Background())
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sync failed")
 }
 
-// newTestRequest creates a new reconcile request for testing.
-func newTestRequest(name, namespace string) reconcile.Request {
-	return reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      name,
-			Namespace: namespace,
-		},
+func TestRunOnce_EmptyCluster(t *testing.T) {
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: "node-role.kubernetes.io/ingress",
 	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+	assert.Empty(t, mock.lastDesired.Aliases)
+	assert.Empty(t, mock.lastDesired.Nodes)
 }

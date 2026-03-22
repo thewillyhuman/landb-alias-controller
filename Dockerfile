@@ -1,7 +1,8 @@
 ARG TARGETARCH
 
 # Build stage
-FROM --platform=${TARGETARCH} registry.cern.ch/docker.io/golang:1.24.4-alpine AS build
+FROM --platform=linux/${TARGETARCH} registry.cern.ch/docker.io/golang:1.24.4-alpine AS build
+ARG TARGETARCH
 WORKDIR /app
 
 # Copy go.mod and go.sum first to leverage Docker layer caching.

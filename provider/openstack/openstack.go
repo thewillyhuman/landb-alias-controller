@@ -2,129 +2,173 @@ package openstack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"regexp"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/dns"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/internal/utils"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/plan" // Added import
-	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/metrics"
+	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
+
+	"github.com/go-logr/logr"
 )
 
+// Auth-error sentinel strings used to detect expired tokens.
 const (
-	metadataCharLimit = 200 // It is 256 but better be safe here :).
+	authFailedStr  = "Authentication failed"
+	unauthorizedStr = "unauthorized"
 )
 
-// Pre-compile the regex for alias normalization for efficiency.
-var aliasRegex = regexp.MustCompile(`--loadl?-\d+-?$`)
+// computeAPI abstracts the OpenStack compute (Nova) operations needed
+// by the provider. A concrete implementation wraps gophercloud; tests
+// supply a mock.
+type computeAPI interface {
+	// getServerID resolves an OpenStack server name to its UUID.
+	getServerID(ctx context.Context, name string) (string, error)
+	// getMetadata returns all metadata key-value pairs for the given server.
+	getMetadata(ctx context.Context, serverID string) (map[string]string, error)
+	// updateMetadata creates or updates the specified metadata keys on a
+	// server. Existing keys not in the map are left untouched.
+	updateMetadata(ctx context.Context, serverID string, meta map[string]string) error
+	// deleteMetadatum removes a single metadata key from a server.
+	deleteMetadatum(ctx context.Context, serverID, key string) error
+}
 
-// --- Provider Implementation ---
-
-// Provider represents a logical session with an OpenStack environment.
-// It is responsible for authenticating with the OpenStack API and for
-// reading and writing DNS records to the OpenStack metadata service.
+// Provider implements provider.Provider for CERN's OpenStack-based LANDB
+// alias system. DNS aliases are stored as server metadata properties on
+// ingress nodes; a separate CERN service reads these and updates DNS.
 type Provider struct {
-	// IdentityEndpoint is the OpenStack Keystone identity endpoint used
-	// for authentication. Typically, this is of the form:
-	//   https://<keystone-host>/v3
-	IdentityEndpoint string
-
-	// DomainName specifies the OpenStack domain under which the user exists.
-	// For most CERN projects, this is "Default".
-	DomainName string
-
-	// TenantName (also called "project name") identifies the OpenStack tenant
-	// within which resources are managed.
-	TenantName string
-
-	// UserName is the OpenStack username used for authentication.
-	UserName string
-
-	// password holds the OpenStack user's password in memory during
-	// authentication. It is deliberately unexported and stored as a byte
-	// slice to allow secure zeroing after use.
-	// DO NOT log, serialize, or expose this field.
+	// identityEndpoint is the OpenStack Keystone URL (e.g., "https://host/v3").
+	identityEndpoint string
+	// domainName is the OpenStack user domain (typically "Default").
+	domainName string
+	// tenantName is the OpenStack project/tenant name.
+	tenantName string
+	// userName is the OpenStack authentication username.
+	userName string
+	// password is kept as a byte slice for secure zeroing after use.
 	password []byte
 
-	// k8sclient is an optional Kubernetes controller-runtime client
-	// that allows integration with cluster state and objects. It must
-	// be non-nil for most controller-related operations.
-	k8sclient client.Client
+	// compute is the abstracted compute API for metadata operations.
+	compute computeAPI
 
-	// computeClient is the authenticated Gophercloud Compute (Nova) ServiceClient
-	// used to perform API calls against OpenStack. It is initialized after
-	// successful authentication.
-	computeClient *gophercloud.ServiceClient
+	// log is the structured logger for this provider instance.
+	log logr.Logger
 }
 
-// NewProvider creates a new Provider instance...
-// (NewProvider documentation and function remain the same...)
-func NewProvider(k8sclient client.Client) (*Provider, error) {
-	log := log.Log
-	// A nil k8sclient is technically allowed, but functions that need it
-	// (like Records) will fail at runtime. We check for it here
-	// as a common courtesy, but the real check is in the methods that use it.
-	if k8sclient == nil {
-		log.V(1).Info("k8sclient is nil; OpenStack provider functions that require " +
-			"Kubernetes integration (like Records) will fail.")
-	}
-
-	provider := &Provider{
-		IdentityEndpoint: os.Getenv("OS_AUTH_URL"),
-		DomainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
-		TenantName:       os.Getenv("OS_PROJECT_NAME"),
-		UserName:         os.Getenv("OS_USERNAME"),
+// NewProvider creates and authenticates a new OpenStack Provider.
+//
+// Configuration is read from environment variables:
+//   - OS_AUTH_URL: Keystone identity endpoint
+//   - OS_USER_DOMAIN_NAME: user domain
+//   - OS_PROJECT_NAME: project/tenant name
+//   - OS_USERNAME: authentication username
+//   - OS_PASSWORD: authentication password
+func NewProvider(log logr.Logger) (*Provider, error) {
+	p := &Provider{
+		identityEndpoint: os.Getenv("OS_AUTH_URL"),
+		domainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
+		tenantName:       os.Getenv("OS_PROJECT_NAME"),
+		userName:         os.Getenv("OS_USERNAME"),
 		password:         []byte(os.Getenv("OS_PASSWORD")),
-		k8sclient:        k8sclient,
+		log:              log.WithName("openstack"),
 	}
 
-	// Validate required configuration *before* attempting authentication
-	if err := provider.validateConfiguration(); err != nil {
-		return nil, fmt.Errorf("invalid OpenStack provider configuration: %w", err)
+	if err := p.validateConfiguration(); err != nil {
+		return nil, fmt.Errorf("invalid OpenStack configuration: %w", err)
 	}
 
-	// Attempt authentication
-	if err := provider.authenticate(); err != nil {
-		return nil, fmt.Errorf("failed to authenticate with OpenStack: %w", err)
+	if err := p.authenticate(); err != nil {
+		return nil, fmt.Errorf("OpenStack authentication failed: %w", err)
 	}
 
-	return provider, nil
+	p.log.Info("OpenStack provider initialized",
+		"endpoint", p.identityEndpoint,
+		"tenant", p.tenantName,
+		"user", p.userName,
+	)
+
+	return p, nil
 }
 
-// (validateConfiguration, ZeroPassword, authenticate, retryWithReauth...
-// ... all remain the same ...)
-
-// validateConfiguration checks if all required fields are set on the Provider
-// struct *before* attempting to use them for authentication.
+// validateConfiguration ensures all required fields are present before
+// attempting authentication.
 func (p *Provider) validateConfiguration() error {
-	if p.IdentityEndpoint == "" {
-		return fmt.Errorf("missing OS_AUTH_URL")
+	missing := make([]string, 0, 5)
+	if p.identityEndpoint == "" {
+		missing = append(missing, "OS_AUTH_URL")
 	}
-	if p.DomainName == "" {
-		return fmt.Errorf("missing OS_USER_DOMAIN_NAME")
+	if p.domainName == "" {
+		missing = append(missing, "OS_USER_DOMAIN_NAME")
 	}
-	if p.TenantName == "" {
-		return fmt.Errorf("missing OS_PROJECT_NAME")
+	if p.tenantName == "" {
+		missing = append(missing, "OS_PROJECT_NAME")
 	}
-	if p.UserName == "" {
-		return fmt.Errorf("missing OS_USERNAME")
+	if p.userName == "" {
+		missing = append(missing, "OS_USERNAME")
 	}
 	if len(p.password) == 0 {
-		return fmt.Errorf("missing OS_PASSWORD")
+		missing = append(missing, "OS_PASSWORD")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
-// ZeroPassword securely wipes the password from the Provider's memory.
+// authenticate creates an OpenStack session and initializes the compute
+// client. It can be called again to refresh an expired token.
+func (p *Provider) authenticate() error {
+	opts := gophercloud.AuthOptions{
+		IdentityEndpoint: p.identityEndpoint,
+		Username:         p.userName,
+		Password:         string(p.password),
+		TenantName:       p.tenantName,
+		DomainName:       p.domainName,
+	}
+
+	providerClient, err := openstack.AuthenticatedClient(context.Background(), opts)
+	if err != nil {
+		return fmt.Errorf("keystone authentication failed: %w", err)
+	}
+
+	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{})
+	if err != nil {
+		return fmt.Errorf("compute client creation failed: %w", err)
+	}
+
+	p.compute = &gophercloudCompute{client: computeClient}
+	p.log.V(1).Info("OpenStack authentication successful")
+	return nil
+}
+
+// retryWithReauth executes an operation and retries once after
+// re-authenticating if the error indicates an expired token.
+func (p *Provider) retryWithReauth(op func() error) error {
+	err := op()
+	if err == nil {
+		return nil
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, authFailedStr) && !strings.Contains(errMsg, unauthorizedStr) {
+		return err
+	}
+
+	p.log.Info("OpenStack token expired, re-authenticating")
+	if authErr := p.authenticate(); authErr != nil {
+		return fmt.Errorf("re-authentication failed: %w (original: %s)", authErr, err)
+	}
+	p.log.Info("Re-authentication successful, retrying operation")
+	return op()
+}
+
+// ZeroPassword securely wipes the password from memory.
 func (p *Provider) ZeroPassword() {
 	for i := range p.password {
 		p.password[i] = 0
@@ -132,479 +176,239 @@ func (p *Provider) ZeroPassword() {
 	p.password = nil
 }
 
-// authenticate authenticates the client with the OpenStack API.
-func (p *Provider) authenticate() error {
-	opts := gophercloud.AuthOptions{
-		IdentityEndpoint: p.IdentityEndpoint,
-		Username:         p.UserName,
-		Password:         string(p.password),
-		TenantName:       p.TenantName,
-		DomainName:       p.DomainName,
+// --- provider.Provider implementation ---
+
+// Sync reconciles the OpenStack server metadata for all nodes in the
+// desired AliasSet.
+//
+// For each node (at index i in the sorted node list):
+//  1. Compute desired metadata by appending --load-i- to each alias
+//     and packing them into metadata keys.
+//  2. Read the node's current metadata from OpenStack.
+//  3. Diff: identify keys to create/update and stale keys to delete.
+//  4. Apply changes via the OpenStack API.
+//
+// All nodes are attempted even if some fail; errors are aggregated.
+func (p *Provider) Sync(ctx context.Context, desired provider.AliasSet) error {
+	log := p.log.WithValues("aliases", len(desired.Aliases), "nodes", len(desired.Nodes))
+	log.Info("Starting alias synchronization")
+
+	var errs []error
+
+	for i, node := range desired.Nodes {
+		nodeLog := log.WithValues("node", node.Name, "index", i)
+		if err := p.syncNode(ctx, nodeLog, node, i, desired.Aliases); err != nil {
+			nodeLog.Error(err, "Failed to sync node")
+			errs = append(errs, fmt.Errorf("node %s: %w", node.Name, err))
+		}
 	}
 
-	// Authenticate against Keystone
-	providerClient, err := openstack.AuthenticatedClient(context.Background(), opts)
-	if err != nil {
-		return fmt.Errorf("failed to authenticate v2: %w", err)
+	if len(errs) > 0 {
+		return fmt.Errorf("sync failed for %d/%d nodes: %w",
+			len(errs), len(desired.Nodes), errors.Join(errs...))
 	}
 
-	// Create the Compute (Nova) service client
-	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{})
-	if err != nil {
-		return fmt.Errorf("failed to create compute client: %w", err)
-	}
-
-	p.computeClient = computeClient
+	log.Info("Alias synchronization completed successfully")
 	return nil
 }
 
-// retryWithReauth retries an operation once if it fails with a common
-// authentication error string.
-func (p *Provider) retryWithReauth(operation func() error) error {
-	log := log.Log
-	err := operation()
-	if err == nil {
-		return nil
-	}
-
-	isAuthError := strings.Contains(err.Error(), internal.AuthFailed) ||
-		strings.Contains(err.Error(), internal.Unauthorized)
-
-	if isAuthError {
-		log.Info("OpenStack token expired, re-authenticating")
-		if authErr := p.authenticate(); authErr != nil {
-			return fmt.Errorf("re-authentication failed: %w (original error: %s)", authErr, err)
-		}
-		log.Info("Successfully re-authenticated with OpenStack, retrying operation")
-		return operation()
-	}
-
-	return err
-}
-
-// Records gathers DNS aliases from OpenStack metadata for all Kubernetes
-// nodes labeled as ingress nodes.
-// This function satisfies the Provider interface.
-// (Function documentation and logic remain the same...)
-func (p *Provider) Records() ([]*dns.Record, error) {
-	log := log.Log
-	// These checks are critical. A Provider must be fully initialized
-	// by NewProvider to be in a valid state to call Records.
-	if p.k8sclient == nil {
-		return nil, fmt.Errorf("kubernetes client is not initialized")
-	}
-	if p.computeClient == nil {
-		return nil, fmt.Errorf("openstack client is not initialized")
-	}
-
-	ctx := context.Background()
-	var nodes corev1.NodeList
-	if err := p.k8sclient.List(ctx, &nodes,
-		client.MatchingLabels{internal.IngressNodeLabelDefault: internal.TrueString}); err != nil {
-		return nil, fmt.Errorf("failed to list ingress nodes: %w", err)
-	}
-
-	var records = make([]*dns.Record, 0)
-
-	for _, node := range nodes.Items {
-		currentNode := node
-		instanceName := currentNode.Name
-
-		// Find the node's IP address robustly
-		nodeIP, err := utils.GetNodeIP(&currentNode)
-		if err != nil {
-			log.Error(err, "Skipping node", "node", instanceName)
-			continue
-		}
-
-		var server *servers.Server
-		opErr := p.retryWithReauth(func() error {
-			serverID, err := p.getServerID(ctx, instanceName)
-			if err != nil {
-				return fmt.Errorf("failed to get server ID for %q: %w", instanceName, err)
-			}
-
-			srv, err := servers.Get(ctx, p.computeClient, serverID).Extract()
-			if err != nil {
-				return fmt.Errorf("failed to get server details for %q: %w", instanceName, err)
-			}
-			server = srv
-			return nil
-		})
-
-		if opErr != nil {
-			log.Error(opErr, "Skipping node: failed to get OpenStack metadata", "node", instanceName)
-			continue
-		}
-
-		// Extract and normalize aliases
-		for key, value := range server.Metadata {
-			if !strings.HasPrefix(key, internal.LandbAliasPrefix) || strings.TrimSpace(value) == "" {
-				continue
-			}
-
-			aliases := strings.Split(value, ",")
-			for _, alias := range aliases {
-				alias = strings.TrimSpace(alias)
-				if alias == "" {
-					continue
-				}
-
-				normalizedAlias := normalizeAlias(alias)
-				if normalizedAlias == "" {
-					continue
-				}
-
-				rec := &dns.Record{
-					Name:   normalizedAlias,
-					Type:   internal.ARecord,
-					TTL:    300, // Hardcoded TTL
-					Values: []string{nodeIP},
-				}
-				records = append(records, rec)
-			}
-		}
-	}
-
-	return records, nil
-}
-
-// (getServerID, normalizeAlias... remain the same ...)
-
-// getServerID looks up the server ID by name.
-func (p *Provider) getServerID(ctx context.Context, name string) (string, error) {
-	request := servers.List(p.computeClient, servers.ListOpts{Name: name})
-	allPages, err := request.AllPages(ctx)
+// syncNode reconciles metadata for a single node.
+func (p *Provider) syncNode(
+	ctx context.Context,
+	log logr.Logger,
+	node provider.NodeInfo,
+	nodeIndex int,
+	aliases []string,
+) error {
+	// Step 1: Compute desired metadata for this node.
+	suffixed := addSuffix(aliases, nodeIndex)
+	desiredMeta, err := packAliases(suffixed)
 	if err != nil {
-		return "", fmt.Errorf("failed to list servers: %w", err)
+		return fmt.Errorf("packing aliases: %w", err)
+	}
+	log.V(1).Info("Computed desired metadata", "keys", len(desiredMeta))
+
+	// Step 2: Resolve the OpenStack server ID.
+	serverID, err := p.getServerIDInstrumented(ctx, node.Name)
+	if err != nil {
+		return fmt.Errorf("resolving server ID: %w", err)
+	}
+	log.V(1).Info("Resolved server ID", "serverID", serverID)
+
+	// Step 3: Read current metadata.
+	currentMeta, err := p.getMetadataInstrumented(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("reading metadata: %w", err)
+	}
+
+	// Step 4: Diff — find keys to update.
+	toUpdate := make(map[string]string)
+	for key, desiredVal := range desiredMeta {
+		if currentVal, exists := currentMeta[key]; !exists || currentVal != desiredVal {
+			log.Info("Metadata key needs update", "key", key,
+				"current", currentMeta[key], "desired", desiredVal)
+			toUpdate[key] = desiredVal
+		}
+	}
+
+	// Step 5: Diff — find stale landb-alias keys to delete.
+	var toDelete []string
+	for key := range currentMeta {
+		if !strings.HasPrefix(key, landbAliasPrefix) {
+			continue
+		}
+		if _, needed := desiredMeta[key]; !needed {
+			log.Info("Stale metadata key will be deleted", "key", key)
+			toDelete = append(toDelete, key)
+		}
+	}
+
+	// Step 6: Apply updates.
+	if len(toUpdate) > 0 {
+		if err := p.updateMetadataInstrumented(ctx, serverID, toUpdate); err != nil {
+			return fmt.Errorf("updating metadata: %w", err)
+		}
+		log.Info("Updated metadata keys", "count", len(toUpdate))
+	}
+
+	// Step 7: Apply deletes.
+	var deleteErrs []error
+	for _, key := range toDelete {
+		if err := p.deleteMetadatumInstrumented(ctx, serverID, key); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("deleting key %q: %w", key, err))
+		} else {
+			log.Info("Deleted stale metadata key", "key", key)
+		}
+	}
+	if len(deleteErrs) > 0 {
+		return errors.Join(deleteErrs...)
+	}
+
+	if len(toUpdate) == 0 && len(toDelete) == 0 {
+		log.V(1).Info("No changes needed")
+	}
+
+	return nil
+}
+
+// --- Instrumented API wrappers ---
+// Each wrapper adds retry-with-reauth, timing, and metrics.
+
+func (p *Provider) getServerIDInstrumented(ctx context.Context, name string) (string, error) {
+	var id string
+	err := p.retryWithReauth(func() error {
+		start := time.Now()
+		var opErr error
+		id, opErr = p.compute.getServerID(ctx, name)
+		dur := time.Since(start).Seconds()
+		metrics.OpenStackAPIDuration.WithLabelValues("get_server_id").Observe(dur)
+		if opErr != nil {
+			metrics.OpenStackAPICalls.WithLabelValues("get_server_id", "error").Inc()
+			return opErr
+		}
+		metrics.OpenStackAPICalls.WithLabelValues("get_server_id", "success").Inc()
+		return nil
+	})
+	return id, err
+}
+
+func (p *Provider) getMetadataInstrumented(ctx context.Context, serverID string) (map[string]string, error) {
+	var meta map[string]string
+	err := p.retryWithReauth(func() error {
+		start := time.Now()
+		var opErr error
+		meta, opErr = p.compute.getMetadata(ctx, serverID)
+		dur := time.Since(start).Seconds()
+		metrics.OpenStackAPIDuration.WithLabelValues("get_metadata").Observe(dur)
+		if opErr != nil {
+			metrics.OpenStackAPICalls.WithLabelValues("get_metadata", "error").Inc()
+			return opErr
+		}
+		metrics.OpenStackAPICalls.WithLabelValues("get_metadata", "success").Inc()
+		return nil
+	})
+	return meta, err
+}
+
+func (p *Provider) updateMetadataInstrumented(ctx context.Context, serverID string, meta map[string]string) error {
+	return p.retryWithReauth(func() error {
+		start := time.Now()
+		err := p.compute.updateMetadata(ctx, serverID, meta)
+		dur := time.Since(start).Seconds()
+		metrics.OpenStackAPIDuration.WithLabelValues("update_metadata").Observe(dur)
+		if err != nil {
+			metrics.OpenStackAPICalls.WithLabelValues("update_metadata", "error").Inc()
+			return err
+		}
+		metrics.OpenStackAPICalls.WithLabelValues("update_metadata", "success").Inc()
+		return nil
+	})
+}
+
+func (p *Provider) deleteMetadatumInstrumented(ctx context.Context, serverID, key string) error {
+	return p.retryWithReauth(func() error {
+		start := time.Now()
+		err := p.compute.deleteMetadatum(ctx, serverID, key)
+		dur := time.Since(start).Seconds()
+		metrics.OpenStackAPIDuration.WithLabelValues("delete_metadatum").Observe(dur)
+		if err != nil {
+			metrics.OpenStackAPICalls.WithLabelValues("delete_metadatum", "error").Inc()
+			return err
+		}
+		metrics.OpenStackAPICalls.WithLabelValues("delete_metadatum", "success").Inc()
+		return nil
+	})
+}
+
+// --- gophercloudCompute: real implementation of computeAPI ---
+
+// gophercloudCompute wraps the gophercloud Nova client to implement
+// the computeAPI interface.
+type gophercloudCompute struct {
+	client *gophercloud.ServiceClient
+}
+
+func (g *gophercloudCompute) getServerID(ctx context.Context, name string) (string, error) {
+	allPages, err := servers.List(g.client, servers.ListOpts{Name: name}).AllPages(ctx)
+	if err != nil {
+		return "", fmt.Errorf("listing servers: %w", err)
 	}
 
 	allServers, err := servers.ExtractServers(allPages)
 	if err != nil {
-		return "", fmt.Errorf("failed to extract servers: %w", err)
+		return "", fmt.Errorf("extracting servers: %w", err)
 	}
 
-	if len(allServers) == 0 {
+	switch len(allServers) {
+	case 0:
 		return "", fmt.Errorf("no server found with name %q", name)
+	case 1:
+		return allServers[0].ID, nil
+	default:
+		return "", fmt.Errorf("multiple servers (%d) found with name %q", len(allServers), name)
 	}
-	if len(allServers) > 1 {
-		// This is a critical ambiguity. The caller must handle it.
-		return "", fmt.Errorf("multiple servers found with name %q", name)
-	}
-
-	return allServers[0].ID, nil
 }
 
-// normalizeAlias removes any trailing load-balancer suffix.
-func normalizeAlias(alias string) string {
-	return aliasRegex.ReplaceAllString(alias, "")
-}
-
-// Reconcile applies the calculated changes to the OpenStack node metadata.
-// This function satisfies the Provider interface by accepting a `plan.Changes`
-// object.
-//
-// **Implementation Note:**
-// The OpenStack provider is not a pure DNS provider. The "desired state"
-// (i.e., which `landb-alias` key gets which suffix) depends on the *full*
-// sorted list of ingress nodes. A simple diff (`plan.Changes`) is not
-// enough information to perform the reconciliation.
-//
-// To solve this, this function *re-calculates* the full desired state:
-//  1. It fetches the *current* state from OpenStack using `p.Records()`.
-//  2. It applies the `changes` to this `current` state to get the *full desired state*.
-//  3. It then runs the full, state-based reconciliation logic against this
-//     `desiredRecords` list.
-//
-// This is inefficient (it reads all node metadata twice per cycle) but
-// correctly implements the interface while preserving the robust, state-based
-// reconciliation logic required by this provider.
-func (p *Provider) Reconcile(changes *plan.Changes) error {
-	log := log.Log
-	if p.k8sclient == nil {
-		return fmt.Errorf("kubernetes client is not initialized")
-	}
-	if p.computeClient == nil {
-		return fmt.Errorf("openstack client is not initialized")
-	}
-
-	// --- Step 1: Re-calculate Full Desired State from Changes ---
-	// We must do this because the reconciliation logic needs the *full*
-	// desired state to calculate suffixes, not just the diff.
-
-	log.Info("Reconciling OpenStack metadata")
-	currentRecords, err := p.Records()
+func (g *gophercloudCompute) getMetadata(ctx context.Context, serverID string) (map[string]string, error) {
+	srv, err := servers.Get(ctx, g.client, serverID).Extract()
 	if err != nil {
-		return fmt.Errorf("failed to get current records to calculate desired state: %w", err)
+		return nil, fmt.Errorf("getting server %s: %w", serverID, err)
 	}
+	return srv.Metadata, nil
+}
 
-	desiredRecords := applyChanges(currentRecords, changes)
-	log.V(1).Info("Successfully calculated full desired state.", "totalDesiredRecords", len(desiredRecords))
-
-	// --- Step 2: Run State-Based Reconciliation ---
-	// The following logic is identical to the old `SetRecords` function,
-	// but it uses the `desiredRecords` list we just calculated.
-
-	ctx := context.Background()
-	var nodes corev1.NodeList
-	if err := p.k8sclient.List(ctx, &nodes,
-		client.MatchingLabels{internal.IngressNodeLabelDefault: internal.TrueString}); err != nil {
-		return fmt.Errorf("failed to list ingress nodes: %w", err)
+func (g *gophercloudCompute) updateMetadata(ctx context.Context, serverID string, meta map[string]string) error {
+	result := servers.UpdateMetadata(ctx, g.client, serverID, servers.MetadataOpts(meta))
+	if result.Err != nil {
+		return fmt.Errorf("updating metadata on %s: %w", serverID, result.Err)
 	}
-
-	// Sort nodes alphabetically to ensure stable --load-N- indices
-	sort.Slice(nodes.Items, func(i, j int) bool {
-		return nodes.Items[i].Name < nodes.Items[j].Name
-	})
-
-	// Create a reverse map of IP -> nodeName for efficient lookup
-	nodeIPMap := make(map[string]string)
-	sortedNodeNames := make([]string, 0, len(nodes.Items))
-
-	for _, node := range nodes.Items {
-		nodeIP, err := utils.GetNodeIP(&node)
-		if err != nil {
-			log.V(1).Info("Skipping node", "node", node.Name, "error", err)
-			continue
-		}
-		nodeIPMap[nodeIP] = node.Name
-		sortedNodeNames = append(sortedNodeNames, node.Name)
-	}
-
-	log.V(1).Info("IP to node name map", "map", sortedNodeNames)
-
-	// Map desired *normalized* aliases to each node
-	desiredNodeAliases := make(map[string][]string)
-	for _, rec := range desiredRecords { // Use desiredRecords
-		if len(rec.Values) == 0 {
-			continue
-		}
-		ip := rec.Values[0]
-
-		nodeName, ok := nodeIPMap[ip]
-		if !ok {
-			log.V(1).Info("Skipping record: its IP does not match any known ingress node", "record", rec.Name, "ip", ip)
-			continue
-		}
-
-		desiredNodeAliases[nodeName] = append(desiredNodeAliases[nodeName], rec.Name)
-	}
-
-	// Iterate and Reconcile Each Node
-	for i, nodeName := range sortedNodeNames {
-		log.V(1).Info("Reconciling aliases for node", "node", nodeName, "index", i)
-
-		// Get this node's actual metadata from OpenStack
-		actualMetadata, err := p.getInstanceMetadata(ctx, nodeName)
-		if err != nil {
-			log.Error(err, "Failed to get metadata for node, skipping", "node", nodeName)
-			continue
-		}
-
-		// Build this node's desired metadata map
-		suffix := fmt.Sprintf("--load-%d-", i)
-		normalizedAliases := desiredNodeAliases[nodeName]
-
-		suffixedAliases := make([]string, len(normalizedAliases))
-		for j, alias := range normalizedAliases {
-			suffixedAliases[j] = alias + suffix
-		}
-
-		desiredMetadata := packAliases(suffixedAliases)
-
-		// Diff and Apply (Update/Create)
-		propsToUpdate := make(map[string]string)
-		for key, desiredValue := range desiredMetadata {
-			actualValue, exists := actualMetadata[key]
-			if !exists || actualValue != desiredValue {
-				log.Info("Updating node metadata", "node", nodeName, "key", key, "value", desiredValue)
-				propsToUpdate[key] = desiredValue
-			}
-		}
-
-		if len(propsToUpdate) > 0 {
-			if err := p.SetInstanceProperties(ctx, nodeName, NewPropertySet(propsToUpdate)); err != nil {
-				log.Error(err, "Failed to set properties for node", "node", nodeName)
-				// Continue to next node even if this one fails
-			}
-		}
-
-		// Diff and Apply (Delete)
-		for key := range actualMetadata {
-			// Only inspect keys we manage
-			if !strings.HasPrefix(key, internal.LandbAliasPrefix) {
-				continue
-			}
-
-			if _, exists := desiredMetadata[key]; !exists {
-				log.Info("Deleting stale node metadata", "node", nodeName, "key", key)
-				if err := p.DeleteInstanceProperty(ctx, nodeName, key); err != nil {
-					log.Error(err, "Failed to delete property for node", "key", key, "node", nodeName)
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
-// recordKey generates a unique identifier (Name:Type) for a DNS record.
-func recordKey(r *dns.Record) string {
-	if r == nil {
-		return ""
+func (g *gophercloudCompute) deleteMetadatum(ctx context.Context, serverID, key string) error {
+	result := servers.DeleteMetadatum(ctx, g.client, serverID, key)
+	if result.Err != nil {
+		return fmt.Errorf("deleting metadatum %q on %s: %w", key, serverID, result.Err)
 	}
-	return fmt.Sprintf("%s:%s", strings.ToLower(r.Name), strings.ToUpper(r.Type))
-}
-
-// applyChanges takes the current records and a set of changes,
-// and returns the new, full list of desired records.
-func applyChanges(current []*dns.Record, changes *plan.Changes) []*dns.Record {
-	// 1. Start with the current records in a map for easy manipulation
-	desiredMap := make(map[string]*dns.Record)
-	for _, r := range current {
-		desiredMap[recordKey(r)] = r
-	}
-
-	// 2. Apply Deletes
-	for _, r := range changes.Delete {
-		delete(desiredMap, recordKey(r))
-	}
-
-	// 3. Apply Updates
-	for _, u := range changes.Update {
-		// Just replace the old one with the new desired one
-		desiredMap[recordKey(u.Desired)] = u.Desired
-	}
-
-	// 4. Apply Creates
-	for _, r := range changes.Create {
-		desiredMap[recordKey(r)] = r
-	}
-
-	// 5. Convert map back to slice
-	desiredList := make([]*dns.Record, 0, len(desiredMap))
-	for _, r := range desiredMap {
-		desiredList = append(desiredList, r)
-	}
-
-	return desiredList
-}
-
-// (packAliases, getKey, SetInstanceProperties, DeleteInstanceProperty,
-// ... and getInstanceMetadata all remain the same ...)
-
-// packAliases takes a list of suffixed aliases and packs them into a
-// map of { "landb-alias": "...", "landb-alias2": "...", ... }
-// respecting the metadataCharLimit.
-func packAliases(aliases []string) map[string]string {
-	packed := make(map[string]string)
-	if len(aliases) == 0 {
-		return packed // Return empty map
-	}
-
-	// Sort aliases to ensure a stable string for diffing
-	sort.Strings(aliases)
-
-	var b strings.Builder
-	keyIndex := 0
-
-	for _, alias := range aliases {
-		// Check if adding this alias (plus a comma) would exceed the limit
-		commaLen := 0
-		if b.Len() > 0 {
-			commaLen = 1 // for the comma separator
-		}
-
-		if b.Len()+len(alias)+commaLen > metadataCharLimit {
-			// Current key is full. Store it.
-			packed[getKey(keyIndex)] = b.String()
-
-			// Start a new key
-			b.Reset()
-			keyIndex++
-		}
-
-		// Add the alias to the current key
-		if b.Len() > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(alias)
-	}
-
-	// Add the last key
-	if b.Len() > 0 {
-		packed[getKey(keyIndex)] = b.String()
-	}
-
-	return packed
-}
-
-// getKey generates the metadata key name (landb-alias, landb-alias2, etc.)
-func getKey(index int) string {
-	if index == 0 {
-		return internal.LandbAliasPrefix
-	}
-	return fmt.Sprintf("%s%d", internal.LandbAliasPrefix, index+1)
-}
-
-// SetInstanceProperties updates or creates metadata keys on a server.
-func (p *Provider) SetInstanceProperties(ctx context.Context, instanceName string, properties *PropertySet) error {
-	log := log.Log
-	return p.retryWithReauth(func() error {
-		serverID, err := p.getServerID(ctx, instanceName)
-		if err != nil {
-			return fmt.Errorf("failed to get server ID for %q: %w", instanceName, err)
-		}
-
-		// Use UpdateMetadata, which replaces keys specified in the map
-		// and leaves other keys untouched.
-		result := servers.UpdateMetadata(ctx, p.computeClient, serverID, properties)
-		if result.Err != nil {
-			log.Error(result.Err, "error setting instance properties", "instance", instanceName)
-			return result.Err
-		}
-		return nil
-	})
-}
-
-// DeleteInstanceProperty deletes a metadata key on a server.
-func (p *Provider) DeleteInstanceProperty(ctx context.Context, instanceName, propertyKey string) error {
-	log := log.Log
-	return p.retryWithReauth(func() error {
-		serverID, err := p.getServerID(ctx, instanceName)
-		if err != nil {
-			return fmt.Errorf("failed to get server ID for %q: %w", instanceName, err)
-		}
-
-		result := servers.DeleteMetadatum(ctx, p.computeClient, serverID, propertyKey)
-		if result.Err != nil {
-			log.Error(result.Err, "error deleting instance property", "key", propertyKey, "instance", instanceName)
-			return result.Err
-		}
-		return nil
-	})
-}
-
-// getInstanceMetadata retrieves the full metadata map for a given server.
-func (p *Provider) getInstanceMetadata(ctx context.Context, instanceName string) (map[string]string, error) {
-	var metadata map[string]string
-
-	err := p.retryWithReauth(func() error {
-		serverID, err := p.getServerID(ctx, instanceName)
-		if err != nil {
-			return fmt.Errorf("failed to get server ID for %q: %w", instanceName, err)
-		}
-
-		srv, err := servers.Get(ctx, p.computeClient, serverID).Extract()
-		if err != nil {
-			return fmt.Errorf("failed to get server details for %q: %w", instanceName, err)
-		}
-		metadata = srv.Metadata
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	return metadata, nil
+	return nil
 }
