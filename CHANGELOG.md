@@ -6,6 +6,12 @@ All notable changes to LanDB Alias Controller are listed here by release or date
 
 ## Versions
 
+### v0.0.2
+
+- (475d5b1) fix: clean up landb-alias metadata from non-ingress nodes — Guillermo Facundo Colunga
+- (de8ba39) docs: regenerate changelog — Guillermo Facundo Colunga
+- (fc6cc5d) docs: add mailmap and changelog/credits generation scripts — Guillermo Facundo Colunga
+
 ### v0.0.1
 
 - (e99eaf3) docs: add changelog and credits — Guillermo Facundo Colunga
