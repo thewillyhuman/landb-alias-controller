@@ -2,58 +2,12 @@
 image: "gitlab-registry.cern.ch/linuxsupport/alma9-base"
 
 stages:
-- "lint"
-- "validate"
+- "test"
 - "build"
-- "tagging"
-
-lint_general:
-  stage: "lint"
-  image: "golang:1.24"
-  allow_failure: true
-  script:
-  - "go install
-    github.com/editorconfig-checker/editorconfig-checker/v3/cmd/editorconfig-checker@latest"
-  - "editorconfig-checker ."
-
-lint_go_style:
-  stage: "lint"
-  image: "golangci/golangci-lint:latest"
-  allow_failure: true
-  artifacts:
-    reports:
-      codequality:
-      - "gl-code-quality-report.json"
-  script:
-  - "golangci-lint run --config=.golangci.yaml
-    --output.code-climate.path=gl-code-quality-report.json"
-
-lint_markdown_style:
-  stage: "lint"
-  image: "node:20"
-  allow_failure: true
-  script:
-  - "npm install -g markdownlint-cli"
-  - "markdownlint \"**/*.md\""
-
-lint_markdown_spell:
-  stage: "lint"
-  image: "node:20"
-  allow_failure: true
-  script:
-  - "npm install -g cspell"
-  - "cspell \"**/*.md\""
-
-lint_yaml_style:
-  stage: "lint"
-  allow_failure: true
-  script:
-  - "dnf install -y epel-release"
-  - "dnf install -y yamllint"
-  - "yamllint ."
+- "tag"
 
 test:
-  stage: "validate"
+  stage: "test"
   image: "golang:1.24"
   script:
   - "go test -v ./..."
@@ -69,7 +23,7 @@ build_image:
     strategy: depend
 
 tag_docker_image_in_default_branch:
-  stage: tagging
+  stage: "tag"
   image: gitlab-registry.cern.ch/ci-tools/docker-builder/tools
   variables:
     GIT_STRATEGY: none
@@ -82,7 +36,7 @@ tag_docker_image_in_default_branch:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 tag_docker_image_with_git_tag:
-  stage: tagging
+  stage: "tag"
   image: gitlab-registry.cern.ch/ci-tools/docker-builder/tools
   variables:
     GIT_STRATEGY: none

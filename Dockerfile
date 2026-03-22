@@ -17,6 +17,7 @@ COPY . .
 # CGO_ENABLED=0 creates a statically linked binary
 # -ldflags="-w -s" strips debug information
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -ldflags="-w -s" -o /landb-alias-controller .
+RUN apk add --no-cache upx && upx --best /landb-alias-controller
 
 # Final distroless image
 FROM scratch
