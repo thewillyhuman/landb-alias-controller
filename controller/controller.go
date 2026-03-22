@@ -107,10 +107,30 @@ func (c *Controller) runOnce(ctx context.Context) error {
 		log.Info("No CERN aliases found in Ingress resources")
 	}
 
-	// Step 3: Sync with the provider.
+	// Step 3: Identify stale nodes (non-ingress nodes that may carry
+	// leftover landb-alias metadata).
+	allNodes, err := c.listAllNodes(ctx)
+	if err != nil {
+		return fmt.Errorf("listing all nodes: %w", err)
+	}
+
+	ingressSet := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		ingressSet[n.Name] = struct{}{}
+	}
+	var staleNodes []provider.NodeInfo
+	for _, n := range allNodes {
+		if _, isIngress := ingressSet[n.Name]; !isIngress {
+			staleNodes = append(staleNodes, n)
+		}
+	}
+	log.V(1).Info("Stale nodes", "count", len(staleNodes))
+
+	// Step 4: Sync with the provider.
 	desired := provider.AliasSet{
-		Aliases: aliases,
-		Nodes:   nodes,
+		Aliases:    aliases,
+		Nodes:      nodes,
+		StaleNodes: staleNodes,
 	}
 	if err := c.Provider.Sync(ctx, desired); err != nil {
 		return fmt.Errorf("provider sync: %w", err)
@@ -182,6 +202,35 @@ func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error)
 	}
 
 	// Sort by name for deterministic --load-N- suffix assignment.
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Name < nodes[j].Name
+	})
+
+	return nodes, nil
+}
+
+// listAllNodes returns all cluster nodes sorted alphabetically by name.
+// This is used to identify stale nodes that may need metadata cleanup.
+func (c *Controller) listAllNodes(ctx context.Context) ([]provider.NodeInfo, error) {
+	log := log.FromContext(ctx)
+	log.V(1).Info("Listing all cluster nodes")
+
+	var nodeList v1.NodeList
+	if err := c.List(ctx, &nodeList); err != nil {
+		return nil, fmt.Errorf("listing all nodes: %w", err)
+	}
+
+	var nodes []provider.NodeInfo
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		ip, err := getNodeIP(node)
+		if err != nil {
+			log.V(1).Info("Skipping node without usable IP", "node", node.Name, "error", err)
+			continue
+		}
+		nodes = append(nodes, provider.NodeInfo{Name: node.Name, IP: ip})
+	}
+
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].Name < nodes[j].Name
 	})

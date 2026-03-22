@@ -227,6 +227,7 @@ func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
 	require.Len(t, mock.lastDesired.Nodes, 2)
 	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name) // Sorted.
 	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
+	assert.Empty(t, mock.lastDesired.StaleNodes)
 }
 
 func TestRunOnce_PropagatesProviderError(t *testing.T) {
@@ -246,6 +247,58 @@ func TestRunOnce_PropagatesProviderError(t *testing.T) {
 	err := c.runOnce(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sync failed")
+}
+
+func TestRunOnce_IdentifiesStaleNodes(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
+		makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", ""),
+		makeNode("node-d", nil, "4.4.4.4", ""),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: label,
+	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+
+	require.Len(t, mock.lastDesired.Nodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name)
+	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
+
+	require.Len(t, mock.lastDesired.StaleNodes, 2)
+	assert.Equal(t, "node-c", mock.lastDesired.StaleNodes[0].Name)
+	assert.Equal(t, "node-d", mock.lastDesired.StaleNodes[1].Name)
+}
+
+func TestRunOnce_AllNodesIngress_NoStaleNodes(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: label,
+	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+	require.Len(t, mock.lastDesired.Nodes, 2)
+	assert.Empty(t, mock.lastDesired.StaleNodes)
 }
 
 func TestRunOnce_EmptyCluster(t *testing.T) {

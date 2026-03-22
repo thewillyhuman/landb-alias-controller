@@ -236,6 +236,67 @@ func TestSync_UpdateMetadataError(t *testing.T) {
 	assert.Contains(t, err.Error(), "updating metadata")
 }
 
+// --- StaleNodes cleanup tests ---
+
+func TestSync_CleansStaleNodes(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["stale-node"] = "id-stale"
+	mock.metadata["id-stale"] = map[string]string{
+		"landb-alias":  "old-app--load-0-",
+		"landb-alias2": "old-app2--load-0-",
+		"other-key":    "keep-me",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.AliasSet{
+		Aliases:    []string{"app1"},
+		StaleNodes: []provider.NodeInfo{{Name: "stale-node", IP: "3.3.3.3"}},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.deletedKeys, "id-stale:landb-alias")
+	assert.Contains(t, mock.deletedKeys, "id-stale:landb-alias2")
+	// Non-landb keys should not be deleted.
+	for _, dk := range mock.deletedKeys {
+		assert.NotContains(t, dk, "other-key")
+	}
+}
+
+func TestSync_StaleNodeWithoutMetadata_NoOp(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["clean-node"] = "id-clean"
+	mock.metadata["id-clean"] = map[string]string{
+		"other-key": "some-value",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.AliasSet{
+		StaleNodes: []provider.NodeInfo{{Name: "clean-node", IP: "3.3.3.3"}},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, mock.deletedKeys)
+}
+
+func TestSync_StaleNodeError_Aggregated(t *testing.T) {
+	mock := newMockCompute()
+	// Ingress node succeeds.
+	mock.serverIDs["node-a"] = "id-a"
+	mock.metadata["id-a"] = map[string]string{}
+	// Stale node fails to resolve.
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.AliasSet{
+		Aliases: []string{"app1"},
+		Nodes:   []provider.NodeInfo{{Name: "node-a", IP: "1.1.1.1"}},
+		StaleNodes: []provider.NodeInfo{{Name: "missing-node", IP: "3.3.3.3"}},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stale node missing-node")
+	// Ingress node should still have been synced.
+	assert.NotEmpty(t, mock.updatedMetadata["id-a"])
+}
+
 func TestSync_DeleteMetadatumError(t *testing.T) {
 	mock := newMockCompute()
 	mock.serverIDs["node-0"] = "id-0"

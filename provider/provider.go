@@ -34,6 +34,11 @@ type AliasSet struct {
 	// Nodes is the ordered list of ingress nodes. The index in this
 	// slice determines the --load-N- suffix assigned to each node.
 	Nodes []NodeInfo
+
+	// StaleNodes are cluster nodes without the ingress label that may
+	// still carry landb-alias metadata from a previous configuration.
+	// The provider should remove any landb-alias* metadata from these.
+	StaleNodes []NodeInfo
 }
 
 // Provider defines the contract that any DNS alias backend must satisfy.

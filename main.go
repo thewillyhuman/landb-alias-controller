@@ -22,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -125,13 +126,29 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel 
 		IngressNodeLabel: ingressNodeLabel,
 	}
 
-	// labelPredicate filters Node events to only those that have (or had)
-	// the ingress node label. This prevents spurious reconciliations from
-	// unrelated node changes.
-	labelPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		_, hasLabel := obj.GetLabels()[ingressNodeLabel]
-		return hasLabel
-	})
+	// hasIngressLabel checks whether an object carries the ingress node label.
+	hasIngressLabel := func(obj client.Object) bool {
+		_, ok := obj.GetLabels()[ingressNodeLabel]
+		return ok
+	}
+
+	// labelPredicate filters Node events to those that have (or had) the
+	// ingress node label. For Update events, it checks both the old and
+	// new object so that label removal also triggers reconciliation.
+	labelPredicate := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return hasIngressLabel(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return hasIngressLabel(e.ObjectOld) || hasIngressLabel(e.ObjectNew)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return hasIngressLabel(e.Object)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return hasIngressLabel(e.Object)
+		},
+	}
 
 	return builder.ControllerManagedBy(mgr).
 		// Reconcile on any Ingress change across all namespaces.

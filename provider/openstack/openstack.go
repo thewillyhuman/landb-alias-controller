@@ -203,9 +203,19 @@ func (p *Provider) Sync(ctx context.Context, desired provider.AliasSet) error {
 		}
 	}
 
+	// Clean up landb-alias metadata from nodes that are no longer ingress.
+	for _, node := range desired.StaleNodes {
+		nodeLog := log.WithValues("node", node.Name, "stale", true)
+		if err := p.cleanupNode(ctx, nodeLog, node); err != nil {
+			nodeLog.Error(err, "Failed to cleanup stale node")
+			errs = append(errs, fmt.Errorf("stale node %s: %w", node.Name, err))
+		}
+	}
+
+	totalNodes := len(desired.Nodes) + len(desired.StaleNodes)
 	if len(errs) > 0 {
 		return fmt.Errorf("sync failed for %d/%d nodes: %w",
-			len(errs), len(desired.Nodes), errors.Join(errs...))
+			len(errs), totalNodes, errors.Join(errs...))
 	}
 
 	log.Info("Alias synchronization completed successfully")
@@ -286,6 +296,55 @@ func (p *Provider) syncNode(
 
 	if len(toUpdate) == 0 && len(toDelete) == 0 {
 		log.V(1).Info("No changes needed")
+	}
+
+	return nil
+}
+
+// cleanupNode removes all landb-alias metadata from a node that is no
+// longer serving ingress traffic.
+func (p *Provider) cleanupNode(
+	ctx context.Context,
+	log logr.Logger,
+	node provider.NodeInfo,
+) error {
+	// Step 1: Resolve the OpenStack server ID.
+	serverID, err := p.getServerIDInstrumented(ctx, node.Name)
+	if err != nil {
+		return fmt.Errorf("resolving server ID: %w", err)
+	}
+
+	// Step 2: Read current metadata.
+	currentMeta, err := p.getMetadataInstrumented(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("reading metadata: %w", err)
+	}
+
+	// Step 3: Find all landb-alias keys.
+	var toDelete []string
+	for key := range currentMeta {
+		if strings.HasPrefix(key, landbAliasPrefix) {
+			toDelete = append(toDelete, key)
+		}
+	}
+
+	if len(toDelete) == 0 {
+		log.V(1).Info("No landb-alias metadata found, nothing to clean")
+		return nil
+	}
+
+	// Step 4: Delete all landb-alias keys.
+	log.Info("Removing stale landb-alias metadata", "keys", len(toDelete))
+	var deleteErrs []error
+	for _, key := range toDelete {
+		if err := p.deleteMetadatumInstrumented(ctx, serverID, key); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("deleting key %q: %w", key, err))
+		} else {
+			log.Info("Deleted stale metadata key", "key", key)
+		}
+	}
+	if len(deleteErrs) > 0 {
+		return errors.Join(deleteErrs...)
 	}
 
 	return nil
