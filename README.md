@@ -15,6 +15,17 @@ create the corresponding DNS records.
 When multiple ingress nodes exist, load-balancing suffixes (`--load-0-`, `--load-1-`, etc.)
 are appended automatically so that LANDB creates A records for DNS round-robin.
 
+### When Are Aliases Added or Removed?
+
+| Event | Action |
+|-------|--------|
+| Node labeled as ingress | Aliases are added to the node's OpenStack metadata |
+| Node unlabeled as ingress | Aliases are removed from the node's OpenStack metadata |
+| Ingress node becomes NotReady | Aliases are removed until the node recovers |
+| Ingress node becomes Ready again | Aliases are re-added on the next reconciliation |
+| Ingress resource created/updated | Aliases are synced across all ready ingress nodes |
+| Ingress resource deleted | Stale aliases are removed from all ingress nodes |
+
 ## Prerequisites
 
 - A Kubernetes cluster running on OpenStack (e.g., created with Magnum).
