@@ -6,6 +6,12 @@ All notable changes to LanDB Alias Controller are listed here by release or date
 
 ## Versions
 
+### v0.0.4
+
+- (8ff6180) docs: document when aliases are added or removed — Guillermo Facundo Colunga
+- (e5969bb) fix: remove aliases from NotReady ingress nodes — Guillermo Facundo Colunga
+- (6482ec1) chore: update CHANGELOG.md — Guillermo Facundo Colunga
+
 ### v0.0.3
 
 - (e13ce0a) fix: detect expired OpenStack tokens using HTTP 401 status code — Guillermo Facundo Colunga
