@@ -39,9 +39,9 @@ import (
 const (
 	// providerOpenStack is the identifier for the OpenStack LANDB provider.
 	providerOpenStack = "openstack"
-	// defaultIngressNodeLabel is the Kubernetes label used to identify
-	// nodes serving ingress traffic.
-	defaultIngressNodeLabel = "node-role.kubernetes.io/ingress"
+	// defaultIngressNodeLabels are the Kubernetes labels used to identify
+	// nodes serving ingress traffic (comma-separated).
+	defaultIngressNodeLabels = "node-role.kubernetes.io/ingress,role=ingress"
 )
 
 var scheme = runtime.NewScheme()
@@ -63,14 +63,14 @@ func main() {
 func run() error {
 	// --- Flags ---
 	var (
-		providerName       string
-		ingressNodeLabel   string
-		cloudConfigSecret  string
+		providerName        string
+		ingressNodeLabels   string
+		cloudConfigSecret   string
 	)
 	flag.StringVar(&providerName, "provider", providerOpenStack,
 		"DNS provider to use (currently only 'openstack').")
-	flag.StringVar(&ingressNodeLabel, "ingress-node-label", defaultIngressNodeLabel,
-		"Kubernetes label identifying ingress nodes.")
+	flag.StringVar(&ingressNodeLabels, "ingress-node-labels", defaultIngressNodeLabels,
+		"Comma-separated Kubernetes labels identifying ingress nodes (OR logic).")
 	flag.StringVar(&cloudConfigSecret, "cloud-config-secret", "",
 		"Read OpenStack credentials from a Kubernetes secret (format: namespace/name, e.g. kube-system/cloud-config).")
 
@@ -84,9 +84,11 @@ func run() error {
 	ctrl.SetLogger(logger)
 	log := ctrl.Log.WithName("setup")
 
+	labels := parseLabels(ingressNodeLabels)
+
 	log.Info("Starting landb-alias-controller",
 		"provider", providerName,
-		"ingressNodeLabel", ingressNodeLabel,
+		"ingressNodeLabels", labels,
 		"cloudConfigSecret", cloudConfigSecret,
 	)
 
@@ -105,7 +107,7 @@ func run() error {
 	}
 
 	// --- Controller Setup ---
-	if err := setupController(mgr, dnsProvider, ingressNodeLabel); err != nil {
+	if err := setupController(mgr, dnsProvider, labels); err != nil {
 		return fmt.Errorf("setting up controller: %w", err)
 	}
 
@@ -163,19 +165,37 @@ func nodeReadyStatus(obj client.Object) corev1.ConditionStatus {
 	return ""
 }
 
+// parseLabels splits a comma-separated label string and parses each entry
+// into a LabelSelector. Entries can be "key" (presence-only) or "key=value".
+func parseLabels(s string) []controller.LabelSelector {
+	var selectors []controller.LabelSelector
+	for _, l := range strings.Split(s, ",") {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			selectors = append(selectors, controller.ParseLabelSelector(l))
+		}
+	}
+	return selectors
+}
+
 // setupController registers the reconciler and configures watches for
 // Ingress and Node resources.
-func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel string) error {
+func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabels []controller.LabelSelector) error {
 	reconciler := &controller.Controller{
-		Client:           mgr.GetClient(),
-		Provider:         prov,
-		IngressNodeLabel: ingressNodeLabel,
+		Client:            mgr.GetClient(),
+		Provider:          prov,
+		IngressNodeLabels: ingressNodeLabels,
 	}
 
-	// hasIngressLabel checks whether an object carries the ingress node label.
+	// hasIngressLabel checks whether an object matches any of the ingress node label selectors.
 	hasIngressLabel := func(obj client.Object) bool {
-		_, ok := obj.GetLabels()[ingressNodeLabel]
-		return ok
+		objLabels := obj.GetLabels()
+		for _, sel := range ingressNodeLabels {
+			if sel.Matches(objLabels) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// labelPredicate filters Node events to those that have (or had) the

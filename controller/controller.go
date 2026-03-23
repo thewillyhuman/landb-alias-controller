@@ -33,6 +33,43 @@ const (
 	requeueDelay = 30 * time.Second
 )
 
+// LabelSelector represents a label key with an optional value.
+// If Value is nil, only the key's presence is required (e.g., "node-role.kubernetes.io/ingress").
+// If Value is non-nil, both key and value must match (e.g., "role=ingress").
+type LabelSelector struct {
+	Key   string
+	Value *string
+}
+
+// Matches returns true if the given labels satisfy this selector.
+func (ls LabelSelector) Matches(labels map[string]string) bool {
+	v, ok := labels[ls.Key]
+	if !ok {
+		return false
+	}
+	if ls.Value != nil {
+		return v == *ls.Value
+	}
+	return true
+}
+
+// String returns the selector as "key" or "key=value".
+func (ls LabelSelector) String() string {
+	if ls.Value != nil {
+		return ls.Key + "=" + *ls.Value
+	}
+	return ls.Key
+}
+
+// ParseLabelSelector parses a string like "key" or "key=value" into a LabelSelector.
+func ParseLabelSelector(s string) LabelSelector {
+	key, value, hasValue := strings.Cut(s, "=")
+	if hasValue {
+		return LabelSelector{Key: key, Value: &value}
+	}
+	return LabelSelector{Key: key}
+}
+
 // Controller reconciles Kubernetes Ingress and Node resources into DNS
 // alias configuration on the infrastructure provider.
 //
@@ -45,9 +82,10 @@ type Controller struct {
 	// Provider is the DNS alias backend (e.g., OpenStack LANDB).
 	Provider provider.Provider
 
-	// IngressNodeLabel is the Kubernetes label key used to identify
-	// nodes that serve ingress traffic (e.g., "node-role.kubernetes.io/ingress").
-	IngressNodeLabel string
+	// IngressNodeLabels are the Kubernetes label selectors used to identify
+	// nodes that serve ingress traffic. A node matching any selector is selected.
+	// Each entry is a LabelSelector with a key and optional value.
+	IngressNodeLabels []LabelSelector
 }
 
 // Reconcile is the entry point called by controller-runtime on each event.
@@ -177,32 +215,49 @@ func (c *Controller) listAliases(ctx context.Context) ([]string, error) {
 	return aliases, nil
 }
 
-// listNodes returns the ingress-labeled nodes sorted alphabetically by
-// name. The sorted order is critical because the node's index determines
-// its --load-N- suffix.
+// listNodes returns ingress-labeled nodes sorted alphabetically by name.
+// A node is selected if it carries any of the configured ingress labels.
+// The sorted order is critical because the node's index determines its
+// --load-N- suffix.
 func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error) {
 	log := log.FromContext(ctx)
-	log.V(1).Info("Listing ingress nodes", "label", c.IngressNodeLabel)
+	log.V(1).Info("Listing ingress nodes", "labels", c.IngressNodeLabels)
 
-	var nodeList v1.NodeList
-	if err := c.List(ctx, &nodeList, client.HasLabels{c.IngressNodeLabel}); err != nil {
-		return nil, fmt.Errorf("listing nodes with label %q: %w", c.IngressNodeLabel, err)
-	}
-
+	// Query once per label selector and deduplicate by node name.
+	seen := make(map[string]struct{})
 	var nodes []provider.NodeInfo
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
-		if !isNodeReady(node) {
-			log.Info("Skipping NotReady ingress node", "node", node.Name)
-			continue
+
+	for _, sel := range c.IngressNodeLabels {
+		var nodeList v1.NodeList
+		var listOpt client.ListOption
+		if sel.Value != nil {
+			listOpt = client.MatchingLabels{sel.Key: *sel.Value}
+		} else {
+			listOpt = client.HasLabels{sel.Key}
 		}
-		ip, err := getNodeIP(node)
-		if err != nil {
-			log.Info("Skipping node without usable IP", "node", node.Name, "error", err)
-			continue
+		if err := c.List(ctx, &nodeList, listOpt); err != nil {
+			return nil, fmt.Errorf("listing nodes with label %q: %w", sel, err)
 		}
-		nodes = append(nodes, provider.NodeInfo{Name: node.Name, IP: ip})
-		log.V(1).Info("Ingress node found", "node", node.Name, "ip", ip)
+
+		for i := range nodeList.Items {
+			node := &nodeList.Items[i]
+			if _, exists := seen[node.Name]; exists {
+				continue
+			}
+			seen[node.Name] = struct{}{}
+
+			if !isNodeReady(node) {
+				log.Info("Skipping NotReady ingress node", "node", node.Name)
+				continue
+			}
+			ip, err := getNodeIP(node)
+			if err != nil {
+				log.Info("Skipping node without usable IP", "node", node.Name, "error", err)
+				continue
+			}
+			nodes = append(nodes, provider.NodeInfo{Name: node.Name, IP: ip})
+			log.V(1).Info("Ingress node found", "node", node.Name, "ip", ip, "matchedLabel", sel.String())
+		}
 	}
 
 	// Sort by name for deterministic --load-N- suffix assignment.

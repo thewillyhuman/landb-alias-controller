@@ -67,13 +67,13 @@ Alternatively, provide credentials via environment variables:
 
 ### Flags
 
-| Flag                      | Default                                | Description                                  |
-|---------------------------|----------------------------------------|----------------------------------------------|
-| `--provider`              | `openstack`                            | DNS provider (currently only `openstack`)     |
-| `--ingress-node-label`    | `node-role.kubernetes.io/ingress`      | Label used to identify ingress nodes          |
-| `--cloud-config-secret`   |                                        | Read credentials from a K8s secret (`namespace/name`) |
-| `--zap-log-level`         | `info`                                 | Log verbosity (`debug`, `info`, `error`)      |
-| `--zap-devel`             | `false`                                | Enable development-mode logging               |
+| Flag                      | Default                                            | Description                                           |
+|---------------------------|----------------------------------------------------|-------------------------------------------------------|
+| `--provider`              | `openstack`                                        | DNS provider (currently only `openstack`)              |
+| `--ingress-node-labels`   | `node-role.kubernetes.io/ingress,role=ingress`      | Comma-separated label selectors for ingress nodes (OR). Use `key` for presence or `key=value` for exact match |
+| `--cloud-config-secret`   |                                                    | Read credentials from a K8s secret (`namespace/name`)  |
+| `--zap-log-level`         | `info`                                             | Log verbosity (`debug`, `info`, `error`)               |
+| `--zap-devel`             | `false`                                            | Enable development-mode logging                        |
 
 ## Deployment
 
