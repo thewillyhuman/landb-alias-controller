@@ -117,6 +117,21 @@ func initProvider(name string, log logr.Logger) (provider.Provider, error) {
 	}
 }
 
+// nodeReadyStatus extracts the Ready condition status from a Node object.
+// Returns an empty string if the object is not a Node or has no Ready condition.
+func nodeReadyStatus(obj client.Object) corev1.ConditionStatus {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return ""
+	}
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status
+		}
+	}
+	return ""
+}
+
 // setupController registers the reconciler and configures watches for
 // Ingress and Node resources.
 func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel string) error {
@@ -150,6 +165,20 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel 
 		},
 	}
 
+	// statusChangedPredicate triggers reconciliation when an ingress-labeled
+	// node's Ready condition changes (e.g., Ready → NotReady or vice versa).
+	statusChangedPredicate := predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return false },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
+		GenericFunc: func(e event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if !hasIngressLabel(e.ObjectOld) && !hasIngressLabel(e.ObjectNew) {
+				return false
+			}
+			return nodeReadyStatus(e.ObjectOld) != nodeReadyStatus(e.ObjectNew)
+		},
+	}
+
 	return builder.ControllerManagedBy(mgr).
 		// Reconcile on any Ingress change across all namespaces.
 		For(&networkingv1.Ingress{}).
@@ -164,7 +193,7 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabel 
 					}}
 				},
 			),
-			builder.WithPredicates(labelPredicate),
+			builder.WithPredicates(predicate.Or(labelPredicate, statusChangedPredicate)),
 		).
 		Complete(reconciler)
 }

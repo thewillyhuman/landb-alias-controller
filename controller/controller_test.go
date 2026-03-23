@@ -63,6 +63,36 @@ func makeNode(name string, labels map[string]string, externalIP, internalIP stri
 	}
 }
 
+func withReadyCondition(node *v1.Node, status v1.ConditionStatus) *v1.Node {
+	node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{
+		Type:   v1.NodeReady,
+		Status: status,
+	})
+	return node
+}
+
+// --- isNodeReady tests ---
+
+func TestIsNodeReady_True(t *testing.T) {
+	node := withReadyCondition(makeNode("n", nil, "1.1.1.1", ""), v1.ConditionTrue)
+	assert.True(t, isNodeReady(node))
+}
+
+func TestIsNodeReady_False(t *testing.T) {
+	node := withReadyCondition(makeNode("n", nil, "1.1.1.1", ""), v1.ConditionFalse)
+	assert.False(t, isNodeReady(node))
+}
+
+func TestIsNodeReady_Unknown(t *testing.T) {
+	node := withReadyCondition(makeNode("n", nil, "1.1.1.1", ""), v1.ConditionUnknown)
+	assert.False(t, isNodeReady(node))
+}
+
+func TestIsNodeReady_NoCondition(t *testing.T) {
+	node := makeNode("n", nil, "1.1.1.1", "")
+	assert.False(t, isNodeReady(node))
+}
+
 // --- listAliases tests ---
 
 func TestListAliases_ExtractsCernHosts(t *testing.T) {
@@ -135,9 +165,9 @@ func TestListAliases_MultipleRulesPerIngress(t *testing.T) {
 func TestListNodes_FiltersAndSortsByName(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
-		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", "10.0.0.2"),
-		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", "10.0.0.1"),
-		makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", "10.0.0.3"),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", "10.0.0.2"), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", "10.0.0.1"), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", "10.0.0.3"), v1.ConditionTrue),
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabel: label}
@@ -154,7 +184,7 @@ func TestListNodes_FiltersAndSortsByName(t *testing.T) {
 func TestListNodes_FallsBackToInternalIP(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
-		makeNode("node-a", map[string]string{label: ""}, "", "10.0.0.1"),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "", "10.0.0.1"), v1.ConditionTrue),
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabel: label}
@@ -167,8 +197,8 @@ func TestListNodes_FallsBackToInternalIP(t *testing.T) {
 func TestListNodes_SkipsNodesWithoutIP(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
-		makeNode("node-a", map[string]string{label: ""}, "", ""),
-		makeNode("node-b", map[string]string{label: ""}, "1.1.1.1", ""),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabel: label}
@@ -208,8 +238,8 @@ func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app1.cern.ch"),
 		makeIngress("ing-2", "default", "app2.cern.ch"),
-		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
-		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
 	).Build()
 
 	mock := &mockProvider{}
@@ -234,7 +264,7 @@ func TestRunOnce_PropagatesProviderError(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app.cern.ch"),
-		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
 	).Build()
 
 	mock := &mockProvider{syncErr: errors.New("sync failed")}
@@ -253,10 +283,10 @@ func TestRunOnce_IdentifiesStaleNodes(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app.cern.ch"),
-		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
-		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
-		makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", ""),
-		makeNode("node-d", nil, "4.4.4.4", ""),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-d", nil, "4.4.4.4", ""), v1.ConditionTrue),
 	).Build()
 
 	mock := &mockProvider{}
@@ -283,8 +313,8 @@ func TestRunOnce_AllNodesIngress_NoStaleNodes(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app.cern.ch"),
-		makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""),
-		makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""), v1.ConditionTrue),
 	).Build()
 
 	mock := &mockProvider{}
@@ -315,4 +345,51 @@ func TestRunOnce_EmptyCluster(t *testing.T) {
 	require.NotNil(t, mock.lastDesired)
 	assert.Empty(t, mock.lastDesired.Aliases)
 	assert.Empty(t, mock.lastDesired.Nodes)
+}
+
+// --- NotReady node tests ---
+
+func TestListNodes_ExcludesNotReadyNodes(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""), v1.ConditionFalse),
+		makeNode("node-c", map[string]string{label: ""}, "3.3.3.3", ""), // No Ready condition.
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabel: label}
+	nodes, err := c.listNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "node-a", nodes[0].Name)
+}
+
+func TestRunOnce_NotReadyIngressNodeIsStale(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
+		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", ""), v1.ConditionFalse),
+		withReadyCondition(makeNode("node-c", map[string]string{"other": "label"}, "3.3.3.3", ""), v1.ConditionTrue),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:           k8sClient,
+		Provider:         mock,
+		IngressNodeLabel: label,
+	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+
+	// Only node-a is Ready and has the ingress label.
+	require.Len(t, mock.lastDesired.Nodes, 1)
+	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name)
+
+	// node-b (ingress but NotReady) and node-c (non-ingress) are stale.
+	require.Len(t, mock.lastDesired.StaleNodes, 2)
+	assert.Equal(t, "node-b", mock.lastDesired.StaleNodes[0].Name)
+	assert.Equal(t, "node-c", mock.lastDesired.StaleNodes[1].Name)
 }

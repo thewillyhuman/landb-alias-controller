@@ -192,6 +192,10 @@ func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error)
 	var nodes []provider.NodeInfo
 	for i := range nodeList.Items {
 		node := &nodeList.Items[i]
+		if !isNodeReady(node) {
+			log.Info("Skipping NotReady ingress node", "node", node.Name)
+			continue
+		}
 		ip, err := getNodeIP(node)
 		if err != nil {
 			log.Info("Skipping node without usable IP", "node", node.Name, "error", err)
@@ -252,4 +256,15 @@ func getNodeIP(node *v1.Node) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no ExternalIP or InternalIP found for node %s", node.Name)
+}
+
+// isNodeReady returns true if the node has a Ready condition with status True.
+// Nodes without a Ready condition are treated as not ready.
+func isNodeReady(node *v1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == v1.NodeReady {
+			return cond.Status == v1.ConditionTrue
+		}
+	}
+	return false
 }

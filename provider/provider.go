@@ -35,8 +35,8 @@ type AliasSet struct {
 	// slice determines the --load-N- suffix assigned to each node.
 	Nodes []NodeInfo
 
-	// StaleNodes are cluster nodes without the ingress label that may
-	// still carry landb-alias metadata from a previous configuration.
+	// StaleNodes are cluster nodes that should not serve aliases — either
+	// because they lack the ingress label or because they are NotReady.
 	// The provider should remove any landb-alias* metadata from these.
 	StaleNodes []NodeInfo
 }
