@@ -18,12 +18,6 @@ import (
 	"github.com/go-logr/logr"
 )
 
-// Auth-error sentinel strings used to detect expired tokens.
-const (
-	authFailedStr  = "Authentication failed"
-	unauthorizedStr = "unauthorized"
-)
-
 // computeAPI abstracts the OpenStack compute (Nova) operations needed
 // by the provider. A concrete implementation wraps gophercloud; tests
 // supply a mock.
@@ -148,15 +142,15 @@ func (p *Provider) authenticate() error {
 }
 
 // retryWithReauth executes an operation and retries once after
-// re-authenticating if the error indicates an expired token.
+// re-authenticating if the error indicates an expired token (HTTP 401).
 func (p *Provider) retryWithReauth(op func() error) error {
 	err := op()
 	if err == nil {
 		return nil
 	}
 
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, authFailedStr) && !strings.Contains(errMsg, unauthorizedStr) {
+	var errCode gophercloud.ErrUnexpectedResponseCode
+	if !errors.As(err, &errCode) || errCode.Actual != 401 {
 		return err
 	}
 

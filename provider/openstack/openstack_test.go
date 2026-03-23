@@ -3,9 +3,11 @@ package openstack
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -295,6 +297,86 @@ func TestSync_StaleNodeError_Aggregated(t *testing.T) {
 	assert.Contains(t, err.Error(), "stale node missing-node")
 	// Ingress node should still have been synced.
 	assert.NotEmpty(t, mock.updatedMetadata["id-a"])
+}
+
+// --- retryWithReauth tests ---
+
+func TestRetryWithReauth_SuccessOnFirstTry(t *testing.T) {
+	p := newTestProvider(newMockCompute())
+
+	calls := 0
+	err := p.retryWithReauth(func() error {
+		calls++
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
+}
+
+func TestRetryWithReauth_NonAuthError_NoRetry(t *testing.T) {
+	p := newTestProvider(newMockCompute())
+
+	calls := 0
+	err := p.retryWithReauth(func() error {
+		calls++
+		return errors.New("some other error")
+	})
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, err.Error(), "some other error")
+}
+
+func TestRetryWithReauth_401Error_TriggersReauth(t *testing.T) {
+	mock := newMockCompute()
+	p := newTestProvider(mock)
+
+	calls := 0
+	err := p.retryWithReauth(func() error {
+		calls++
+		if calls == 1 {
+			return gophercloud.ErrUnexpectedResponseCode{
+				Actual: 401,
+			}
+		}
+		return nil
+	})
+	// retryWithReauth calls p.authenticate() which will fail because
+	// the provider has no real OpenStack credentials. That's expected.
+	// The important thing is that a 401 triggers the reauth path.
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, err.Error(), "re-authentication failed")
+}
+
+func TestRetryWithReauth_Non401HTTPError_NoRetry(t *testing.T) {
+	p := newTestProvider(newMockCompute())
+
+	calls := 0
+	err := p.retryWithReauth(func() error {
+		calls++
+		return gophercloud.ErrUnexpectedResponseCode{
+			Actual: 404,
+		}
+	})
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+}
+
+func TestRetryWithReauth_Wrapped401Error_TriggersReauth(t *testing.T) {
+	p := newTestProvider(newMockCompute())
+
+	calls := 0
+	err := p.retryWithReauth(func() error {
+		calls++
+		wrapped := fmt.Errorf("listing servers: %w", gophercloud.ErrUnexpectedResponseCode{
+			Actual: 401,
+		})
+		return wrapped
+	})
+	// Should detect the 401 via errors.As even when wrapped.
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, err.Error(), "re-authentication failed")
 }
 
 func TestSync_DeleteMetadatumError(t *testing.T) {
