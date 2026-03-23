@@ -35,9 +35,27 @@ are appended automatically so that LANDB creates A records for DNS round-robin.
 
 ## Configuration
 
-### Environment Variables
+### Authentication
 
-The OpenStack provider requires the following environment variables:
+The controller supports two authentication methods:
+
+#### Option 1: Cloud-Config Secret (recommended for Magnum clusters)
+
+On Magnum-created clusters, a `cloud-config` secret with OpenStack credentials already exists
+in the `kube-system` namespace. The controller can read it directly, requiring no additional
+credential configuration:
+
+```bash
+--cloud-config-secret=kube-system/cloud-config
+```
+
+This uses trust-based authentication (`user-id` + `trust-id`) from the secret's `cloud.conf` key.
+The controller's service account needs RBAC permission to `get` the secret (see the Helm chart's
+`cloudConfig.enabled` option which sets this up automatically).
+
+#### Option 2: Environment Variables
+
+Alternatively, provide credentials via environment variables:
 
 | Variable             | Description                          | Example                              |
 |----------------------|--------------------------------------|--------------------------------------|
@@ -49,12 +67,13 @@ The OpenStack provider requires the following environment variables:
 
 ### Flags
 
-| Flag                    | Default                                | Description                              |
-|-------------------------|----------------------------------------|------------------------------------------|
-| `--provider`            | `openstack`                            | DNS provider (currently only `openstack`)|
-| `--ingress-node-label`  | `node-role.kubernetes.io/ingress`      | Label used to identify ingress nodes     |
-| `--zap-log-level`       | `info`                                 | Log verbosity (`debug`, `info`, `error`) |
-| `--zap-devel`           | `false`                                | Enable development-mode logging          |
+| Flag                      | Default                                | Description                                  |
+|---------------------------|----------------------------------------|----------------------------------------------|
+| `--provider`              | `openstack`                            | DNS provider (currently only `openstack`)     |
+| `--ingress-node-label`    | `node-role.kubernetes.io/ingress`      | Label used to identify ingress nodes          |
+| `--cloud-config-secret`   |                                        | Read credentials from a K8s secret (`namespace/name`) |
+| `--zap-log-level`         | `info`                                 | Log verbosity (`debug`, `info`, `error`)      |
+| `--zap-devel`             | `false`                                | Enable development-mode logging               |
 
 ## Deployment
 

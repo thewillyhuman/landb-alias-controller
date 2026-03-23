@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -37,14 +36,11 @@ type computeAPI interface {
 // alias system. DNS aliases are stored as server metadata properties on
 // ingress nodes; a separate CERN service reads these and updates DNS.
 type Provider struct {
-	// identityEndpoint is the OpenStack Keystone URL (e.g., "https://host/v3").
-	identityEndpoint string
-	// domainName is the OpenStack user domain (typically "Default").
-	domainName string
-	// tenantName is the OpenStack project/tenant name.
-	tenantName string
-	// userName is the OpenStack authentication username.
-	userName string
+	// authOpts holds the OpenStack authentication options. Supports both
+	// username-based auth (Username/Password/TenantName/DomainName) and
+	// trust-based auth (UserID/Password/TrustID) from cloud-config.
+	authOpts gophercloud.AuthOptions
+
 	// password is kept as a byte slice for secure zeroing after use.
 	password []byte
 
@@ -57,23 +53,16 @@ type Provider struct {
 
 // NewProvider creates and authenticates a new OpenStack Provider.
 //
-// Configuration is read from environment variables:
-//   - OS_AUTH_URL: Keystone identity endpoint
-//   - OS_USER_DOMAIN_NAME: user domain
-//   - OS_PROJECT_NAME: project/tenant name
-//   - OS_USERNAME: authentication username
-//   - OS_PASSWORD: authentication password
-func NewProvider(log logr.Logger) (*Provider, error) {
+// The authOpts parameter contains pre-built authentication options,
+// either from environment variables or from a cloud-config secret.
+func NewProvider(log logr.Logger, authOpts gophercloud.AuthOptions) (*Provider, error) {
 	p := &Provider{
-		identityEndpoint: os.Getenv("OS_AUTH_URL"),
-		domainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
-		tenantName:       os.Getenv("OS_PROJECT_NAME"),
-		userName:         os.Getenv("OS_USERNAME"),
-		password:         []byte(os.Getenv("OS_PASSWORD")),
-		log:              log.WithName("openstack"),
+		authOpts: authOpts,
+		password: []byte(authOpts.Password),
+		log:      log.WithName("openstack"),
 	}
 
-	if err := p.validateConfiguration(); err != nil {
+	if err := p.validateAuthOptions(); err != nil {
 		return nil, fmt.Errorf("invalid OpenStack configuration: %w", err)
 	}
 
@@ -81,36 +70,50 @@ func NewProvider(log logr.Logger) (*Provider, error) {
 		return nil, fmt.Errorf("OpenStack authentication failed: %w", err)
 	}
 
-	p.log.Info("OpenStack provider initialized",
-		"endpoint", p.identityEndpoint,
-		"tenant", p.tenantName,
-		"user", p.userName,
-	)
+	logFields := []interface{}{"endpoint", p.authOpts.IdentityEndpoint}
+	if p.authOpts.UserID != "" {
+		logFields = append(logFields, "userID", p.authOpts.UserID)
+	} else {
+		logFields = append(logFields, "tenant", p.authOpts.TenantName, "user", p.authOpts.Username)
+	}
+	p.log.Info("OpenStack provider initialized", logFields...)
 
 	return p, nil
 }
 
-// validateConfiguration ensures all required fields are present before
-// attempting authentication.
-func (p *Provider) validateConfiguration() error {
-	missing := make([]string, 0, 5)
-	if p.identityEndpoint == "" {
-		missing = append(missing, "OS_AUTH_URL")
+// validateAuthOptions ensures all required authentication fields are
+// present. It supports two modes:
+//   - Trust-based (UserID set): requires IdentityEndpoint, UserID, Password, TrustID
+//   - Username-based (Username set): requires IdentityEndpoint, Username, Password, TenantName, DomainName
+func (p *Provider) validateAuthOptions() error {
+	var missing []string
+
+	if p.authOpts.IdentityEndpoint == "" {
+		missing = append(missing, "identity-endpoint")
 	}
-	if p.domainName == "" {
-		missing = append(missing, "OS_USER_DOMAIN_NAME")
+	if p.authOpts.Password == "" {
+		missing = append(missing, "password")
 	}
-	if p.tenantName == "" {
-		missing = append(missing, "OS_PROJECT_NAME")
+
+	if p.authOpts.UserID != "" {
+		// Trust-based auth (cloud-config mode).
+		if p.authOpts.Scope == nil || p.authOpts.Scope.TrustID == "" {
+			missing = append(missing, "trust-id")
+		}
+	} else if p.authOpts.Username != "" {
+		// Username-based auth (env var mode).
+		if p.authOpts.TenantName == "" {
+			missing = append(missing, "tenant-name")
+		}
+		if p.authOpts.DomainName == "" {
+			missing = append(missing, "domain-name")
+		}
+	} else {
+		missing = append(missing, "user-id or username")
 	}
-	if p.userName == "" {
-		missing = append(missing, "OS_USERNAME")
-	}
-	if len(p.password) == 0 {
-		missing = append(missing, "OS_PASSWORD")
-	}
+
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -118,15 +121,7 @@ func (p *Provider) validateConfiguration() error {
 // authenticate creates an OpenStack session and initializes the compute
 // client. It can be called again to refresh an expired token.
 func (p *Provider) authenticate() error {
-	opts := gophercloud.AuthOptions{
-		IdentityEndpoint: p.identityEndpoint,
-		Username:         p.userName,
-		Password:         string(p.password),
-		TenantName:       p.tenantName,
-		DomainName:       p.domainName,
-	}
-
-	providerClient, err := openstack.AuthenticatedClient(context.Background(), opts)
+	providerClient, err := openstack.AuthenticatedClient(context.Background(), p.authOpts)
 	if err != nil {
 		return fmt.Errorf("keystone authentication failed: %w", err)
 	}

@@ -11,8 +11,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/gophercloud/gophercloud/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -61,13 +63,16 @@ func main() {
 func run() error {
 	// --- Flags ---
 	var (
-		providerName     string
-		ingressNodeLabel string
+		providerName       string
+		ingressNodeLabel   string
+		cloudConfigSecret  string
 	)
 	flag.StringVar(&providerName, "provider", providerOpenStack,
 		"DNS provider to use (currently only 'openstack').")
 	flag.StringVar(&ingressNodeLabel, "ingress-node-label", defaultIngressNodeLabel,
 		"Kubernetes label identifying ingress nodes.")
+	flag.StringVar(&cloudConfigSecret, "cloud-config-secret", "",
+		"Read OpenStack credentials from a Kubernetes secret (format: namespace/name, e.g. kube-system/cloud-config).")
 
 	// controller-runtime's zap flag set (--zap-log-level, --zap-devel, etc.)
 	zapOpts := zap.Options{}
@@ -82,6 +87,7 @@ func run() error {
 	log.Info("Starting landb-alias-controller",
 		"provider", providerName,
 		"ingressNodeLabel", ingressNodeLabel,
+		"cloudConfigSecret", cloudConfigSecret,
 	)
 
 	// --- Controller Manager ---
@@ -93,7 +99,7 @@ func run() error {
 	}
 
 	// --- Provider ---
-	dnsProvider, err := initProvider(providerName, ctrl.Log)
+	dnsProvider, err := initProvider(providerName, ctrl.Log, cloudConfigSecret, mgr.GetAPIReader())
 	if err != nil {
 		return fmt.Errorf("initializing provider: %w", err)
 	}
@@ -108,13 +114,38 @@ func run() error {
 }
 
 // initProvider creates the configured DNS alias provider.
-func initProvider(name string, log logr.Logger) (provider.Provider, error) {
+func initProvider(name string, log logr.Logger, cloudConfigSecret string, reader client.Reader) (provider.Provider, error) {
 	switch name {
 	case providerOpenStack:
-		return openstack.NewProvider(log)
+		authOpts, err := buildAuthOptions(cloudConfigSecret, reader)
+		if err != nil {
+			return nil, err
+		}
+		return openstack.NewProvider(log, authOpts)
 	default:
 		return nil, errors.New(fmt.Sprintf("unknown provider %q; supported: %s", name, providerOpenStack))
 	}
+}
+
+// buildAuthOptions constructs OpenStack auth options from either a
+// cloud-config Kubernetes secret or environment variables.
+func buildAuthOptions(cloudConfigSecret string, reader client.Reader) (gophercloud.AuthOptions, error) {
+	if cloudConfigSecret != "" {
+		namespace, name, ok := strings.Cut(cloudConfigSecret, "/")
+		if !ok {
+			return gophercloud.AuthOptions{}, fmt.Errorf(
+				"invalid --cloud-config-secret format %q; expected namespace/name", cloudConfigSecret)
+		}
+		return openstack.ReadCloudConfigSecret(context.Background(), reader, namespace, name)
+	}
+
+	return gophercloud.AuthOptions{
+		IdentityEndpoint: os.Getenv("OS_AUTH_URL"),
+		Username:         os.Getenv("OS_USERNAME"),
+		Password:         os.Getenv("OS_PASSWORD"),
+		TenantName:       os.Getenv("OS_PROJECT_NAME"),
+		DomainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
+	}, nil
 }
 
 // nodeReadyStatus extracts the Ready condition status from a Node object.
