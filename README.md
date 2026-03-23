@@ -15,6 +15,18 @@ create the corresponding DNS records.
 When multiple ingress nodes exist, load-balancing suffixes (`--load-0-`, `--load-1-`, etc.)
 are appended automatically so that LANDB creates A records for DNS round-robin.
 
+### Load-Balancing Suffix Assignment
+
+Suffixes are assigned based on the **alphabetical order** of node names, ensuring
+deterministic and stable assignment across reconciliation runs. For example, with
+nodes `node-a`, `node-b`, and `node-c`, the suffixes are always `--load-0-`,
+`--load-1-`, and `--load-2-` respectively.
+
+Note: if a node is added or removed from the middle of the sorted list, all nodes
+after it get their suffixes shifted (e.g., removing `node-b` causes `node-c` to
+move from `--load-2-` to `--load-1-`). This triggers metadata updates on all
+affected nodes but ensures the suffix range remains contiguous.
+
 ### When Are Aliases Added or Removed?
 
 | Event | Action |
