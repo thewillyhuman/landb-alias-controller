@@ -6,6 +6,11 @@ All notable changes to LanDB Alias Controller are listed here by release or date
 
 ## Versions
 
+### v0.0.5
+
+- (19644ed) feat: support authentication via cloud-config secret — Guillermo Facundo Colunga
+- (e177e0d) chore: update CHANGELOG.md — Guillermo Facundo Colunga
+
 ### v0.0.4
 
 - (8ff6180) docs: document when aliases are added or removed — Guillermo Facundo Colunga
