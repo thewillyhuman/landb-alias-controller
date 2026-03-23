@@ -6,6 +6,11 @@ All notable changes to LanDB Alias Controller are listed here by release or date
 
 ## Versions
 
+### v0.0.6
+
+- (4b71966) feat: support multiple ingress node label selectors — Guillermo Facundo Colunga
+- (0074cd8) chore: update CHANGELOG.md — Guillermo Facundo Colunga
+
 ### v0.0.5
 
 - (19644ed) feat: support authentication via cloud-config secret — Guillermo Facundo Colunga
