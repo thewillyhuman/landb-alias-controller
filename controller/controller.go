@@ -114,7 +114,7 @@ func (c *Controller) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 
 // runOnce performs a single full reconciliation cycle:
 //  1. List all CERN aliases from Ingress resources.
-//  2. List all ingress-labeled nodes with their IPs.
+//  2. List all ingress-labeled nodes.
 //  3. Build the AliasSet and pass it to the provider.
 func (c *Controller) runOnce(ctx context.Context) error {
 	log := log.FromContext(ctx)
@@ -127,14 +127,14 @@ func (c *Controller) runOnce(ctx context.Context) error {
 	log.V(1).Info("Desired aliases", "count", len(aliases), "aliases", aliases)
 	metrics.AliasesDesired.Set(float64(len(aliases)))
 
-	// Step 2: Collect ingress nodes with their IPs.
+	// Step 2: Collect ingress nodes.
 	nodes, err := c.listNodes(ctx)
 	if err != nil {
 		return fmt.Errorf("listing nodes: %w", err)
 	}
 	log.V(1).Info("Ingress nodes", "count", len(nodes))
 	for _, n := range nodes {
-		log.V(1).Info("  Node", "name", n.Name, "ip", n.IP)
+		log.V(1).Info("  Node", "name", n.Name)
 	}
 	metrics.NodesManaged.Set(float64(len(nodes)))
 
@@ -250,13 +250,8 @@ func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error)
 				log.Info("Skipping NotReady ingress node", "node", node.Name)
 				continue
 			}
-			ip, err := getNodeIP(node)
-			if err != nil {
-				log.Info("Skipping node without usable IP", "node", node.Name, "error", err)
-				continue
-			}
-			nodes = append(nodes, provider.NodeInfo{Name: node.Name, IP: ip})
-			log.V(1).Info("Ingress node found", "node", node.Name, "ip", ip, "matchedLabel", sel.String())
+			nodes = append(nodes, provider.NodeInfo{Name: node.Name})
+			log.V(1).Info("Ingress node found", "node", node.Name, "matchedLabel", sel.String())
 		}
 	}
 
@@ -282,12 +277,7 @@ func (c *Controller) listAllNodes(ctx context.Context) ([]provider.NodeInfo, err
 	var nodes []provider.NodeInfo
 	for i := range nodeList.Items {
 		node := &nodeList.Items[i]
-		ip, err := getNodeIP(node)
-		if err != nil {
-			log.V(1).Info("Skipping node without usable IP", "node", node.Name, "error", err)
-			continue
-		}
-		nodes = append(nodes, provider.NodeInfo{Name: node.Name, IP: ip})
+		nodes = append(nodes, provider.NodeInfo{Name: node.Name})
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -295,22 +285,6 @@ func (c *Controller) listAllNodes(ctx context.Context) ([]provider.NodeInfo, err
 	})
 
 	return nodes, nil
-}
-
-// getNodeIP extracts the best available IP address from a Kubernetes node,
-// preferring ExternalIP over InternalIP.
-func getNodeIP(node *v1.Node) (string, error) {
-	for _, addr := range node.Status.Addresses {
-		if addr.Type == v1.NodeExternalIP && addr.Address != "" {
-			return addr.Address, nil
-		}
-	}
-	for _, addr := range node.Status.Addresses {
-		if addr.Type == v1.NodeInternalIP && addr.Address != "" {
-			return addr.Address, nil
-		}
-	}
-	return "", fmt.Errorf("no ExternalIP or InternalIP found for node %s", node.Name)
 }
 
 // isNodeReady returns true if the node has a Ready condition with status True.

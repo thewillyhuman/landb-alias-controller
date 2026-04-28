@@ -176,59 +176,20 @@ func TestListNodes_FiltersAndSortsByName(t *testing.T) {
 
 	require.Len(t, nodes, 2)
 	assert.Equal(t, "node-a", nodes[0].Name)
-	assert.Equal(t, "1.1.1.1", nodes[0].IP) // Prefers ExternalIP.
 	assert.Equal(t, "node-b", nodes[1].Name)
-	assert.Equal(t, "2.2.2.2", nodes[1].IP)
 }
 
-func TestListNodes_FallsBackToInternalIP(t *testing.T) {
-	label := "node-role.kubernetes.io/ingress"
-	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
-		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "", "10.0.0.1"), v1.ConditionTrue),
-	).Build()
-
-	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
-	nodes, err := c.listNodes(context.Background())
-	require.NoError(t, err)
-	require.Len(t, nodes, 1)
-	assert.Equal(t, "10.0.0.1", nodes[0].IP)
-}
-
-func TestListNodes_SkipsNodesWithoutIP(t *testing.T) {
+func TestListNodes_IncludesNodesWithoutIP(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "", ""), v1.ConditionTrue),
-		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
 	nodes, err := c.listNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
-	assert.Equal(t, "node-b", nodes[0].Name)
-}
-
-// --- getNodeIP tests ---
-
-func TestGetNodeIP_PrefersExternal(t *testing.T) {
-	node := makeNode("n", nil, "1.2.3.4", "10.0.0.1")
-	ip, err := getNodeIP(node)
-	require.NoError(t, err)
-	assert.Equal(t, "1.2.3.4", ip)
-}
-
-func TestGetNodeIP_FallsBackToInternal(t *testing.T) {
-	node := makeNode("n", nil, "", "10.0.0.1")
-	ip, err := getNodeIP(node)
-	require.NoError(t, err)
-	assert.Equal(t, "10.0.0.1", ip)
-}
-
-func TestGetNodeIP_ErrorWhenNoIP(t *testing.T) {
-	node := makeNode("n", nil, "", "")
-	_, err := getNodeIP(node)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no ExternalIP or InternalIP")
+	assert.Equal(t, "node-a", nodes[0].Name)
 }
 
 // --- runOnce integration test ---
@@ -244,8 +205,8 @@ func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
 
 	mock := &mockProvider{}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: label}},
 	}
 
@@ -269,8 +230,8 @@ func TestRunOnce_PropagatesProviderError(t *testing.T) {
 
 	mock := &mockProvider{syncErr: errors.New("sync failed")}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: label}},
 	}
 
@@ -291,8 +252,8 @@ func TestRunOnce_IdentifiesStaleNodes(t *testing.T) {
 
 	mock := &mockProvider{}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: label}},
 	}
 
@@ -319,8 +280,8 @@ func TestRunOnce_AllNodesIngress_NoStaleNodes(t *testing.T) {
 
 	mock := &mockProvider{}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: label}},
 	}
 
@@ -335,8 +296,8 @@ func TestRunOnce_EmptyCluster(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).Build()
 	mock := &mockProvider{}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: "node-role.kubernetes.io/ingress"}},
 	}
 
@@ -375,8 +336,8 @@ func TestRunOnce_NotReadyIngressNodeIsStale(t *testing.T) {
 
 	mock := &mockProvider{}
 	c := &Controller{
-		Client:           k8sClient,
-		Provider:         mock,
+		Client:            k8sClient,
+		Provider:          mock,
 		IngressNodeLabels: []LabelSelector{{Key: label}},
 	}
 

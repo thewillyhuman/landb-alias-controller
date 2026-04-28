@@ -417,6 +417,9 @@ type gophercloudCompute struct {
 }
 
 func (g *gophercloudCompute) getServerID(ctx context.Context, name string) (string, error) {
+	// TODO: Resolve servers from the Kubernetes node spec.providerID instead of
+	// name. Nova names are not guaranteed to be unique, and providerID exposes
+	// the real instance UUID for both bare metal and VM-backed nodes.
 	allPages, err := servers.List(g.client, servers.ListOpts{Name: name}).AllPages(ctx)
 	if err != nil {
 		return "", fmt.Errorf("listing servers: %w", err)

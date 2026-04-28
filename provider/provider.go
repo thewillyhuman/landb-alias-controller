@@ -15,10 +15,6 @@ type NodeInfo struct {
 	// Name is the Kubernetes node name, which must match the OpenStack
 	// server name so the provider can locate the corresponding instance.
 	Name string
-
-	// IP is the node's routable IP address (ExternalIP preferred,
-	// InternalIP as fallback).
-	IP string
 }
 
 // AliasSet represents the complete desired state of DNS aliases.

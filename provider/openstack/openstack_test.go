@@ -27,9 +27,9 @@ type mockCompute struct {
 	deletedKeys []string
 
 	// Inject errors for specific operations.
-	getServerIDErr    error
-	getMetadataErr    error
-	updateMetadataErr error
+	getServerIDErr     error
+	getMetadataErr     error
+	updateMetadataErr  error
 	deleteMetadatumErr error
 }
 
@@ -124,7 +124,7 @@ func TestSync_NoAliases_ClearsExistingMetadata(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{},
-		Nodes:   []provider.NodeInfo{{Name: "node-0", IP: "1.1.1.1"}},
+		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
@@ -144,8 +144,8 @@ func TestSync_CreatesMetadata(t *testing.T) {
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1", "app2"},
 		Nodes: []provider.NodeInfo{
-			{Name: "node-a", IP: "1.1.1.1"},
-			{Name: "node-b", IP: "2.2.2.2"},
+			{Name: "node-a"},
+			{Name: "node-b"},
 		},
 	})
 	require.NoError(t, err)
@@ -169,7 +169,7 @@ func TestSync_NoChangesNeeded(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1", "app2"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0", IP: "1.1.1.1"}},
+		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
@@ -189,7 +189,7 @@ func TestSync_DeletesStaleKeys(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0", IP: "1.1.1.1"}},
+		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
@@ -211,8 +211,8 @@ func TestSync_AggregatesErrors(t *testing.T) {
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1"},
 		Nodes: []provider.NodeInfo{
-			{Name: "node-a", IP: "1.1.1.1"},
-			{Name: "node-b", IP: "2.2.2.2"},
+			{Name: "node-a"},
+			{Name: "node-b"},
 		},
 	})
 
@@ -232,7 +232,7 @@ func TestSync_UpdateMetadataError(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0", IP: "1.1.1.1"}},
+		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updating metadata")
@@ -252,7 +252,7 @@ func TestSync_CleansStaleNodes(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases:    []string{"app1"},
-		StaleNodes: []provider.NodeInfo{{Name: "stale-node", IP: "3.3.3.3"}},
+		StaleNodes: []provider.NodeInfo{{Name: "stale-node"}},
 	})
 	require.NoError(t, err)
 
@@ -273,7 +273,7 @@ func TestSync_StaleNodeWithoutMetadata_NoOp(t *testing.T) {
 
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
-		StaleNodes: []provider.NodeInfo{{Name: "clean-node", IP: "3.3.3.3"}},
+		StaleNodes: []provider.NodeInfo{{Name: "clean-node"}},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, mock.deletedKeys)
@@ -288,9 +288,9 @@ func TestSync_StaleNodeError_Aggregated(t *testing.T) {
 
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-a", IP: "1.1.1.1"}},
-		StaleNodes: []provider.NodeInfo{{Name: "missing-node", IP: "3.3.3.3"}},
+		Aliases:    []string{"app1"},
+		Nodes:      []provider.NodeInfo{{Name: "node-a"}},
+		StaleNodes: []provider.NodeInfo{{Name: "missing-node"}},
 	})
 
 	require.Error(t, err)
@@ -391,7 +391,7 @@ func TestSync_DeleteMetadatumError(t *testing.T) {
 	p := newTestProvider(mock)
 	err := p.Sync(context.Background(), provider.AliasSet{
 		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0", IP: "1.1.1.1"}},
+		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deleting key")
