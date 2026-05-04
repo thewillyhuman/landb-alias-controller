@@ -106,9 +106,9 @@ func TestSync_NoNodes(t *testing.T) {
 	mock := newMockCompute()
 	p := newTestProvider(mock)
 
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1"},
-		Nodes:   nil,
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{"app1"},
+		IngressNodes: nil,
 	})
 	require.NoError(t, err)
 }
@@ -122,9 +122,9 @@ func TestSync_NoAliases_ClearsExistingMetadata(t *testing.T) {
 	}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{},
-		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{},
+		IngressNodes: []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
@@ -141,9 +141,9 @@ func TestSync_CreatesMetadata(t *testing.T) {
 	mock.metadata["id-b"] = map[string]string{}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
+	err := p.Sync(context.Background(), provider.DesiredState{
 		Aliases: []string{"app1", "app2"},
-		Nodes: []provider.NodeInfo{
+		IngressNodes: []provider.NodeInfo{
 			{Name: "node-a"},
 			{Name: "node-b"},
 		},
@@ -167,9 +167,9 @@ func TestSync_NoChangesNeeded(t *testing.T) {
 	}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1", "app2"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{"app1", "app2"},
+		IngressNodes: []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
@@ -187,14 +187,91 @@ func TestSync_DeletesStaleKeys(t *testing.T) {
 	}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{"app1"},
+		IngressNodes: []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.NoError(t, err)
 
 	// landb-alias2 should be deleted (no longer needed).
 	assert.Contains(t, mock.deletedKeys, "id-0:landb-alias2")
+}
+
+func TestSync_CreatesLandbSetMetadata(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["node-0"] = "id-0"
+	mock.metadata["id-0"] = map[string]string{}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		LandbSetNodes: []provider.NodeInfo{{Name: "node-0", LandbSet: "mylandbset"}},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "mylandbset", mock.updatedMetadata["id-0"][landbSetMetadataKey])
+}
+
+func TestSync_CreatesMultipleLandbSetMetadata(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["node-0"] = "id-0"
+	mock.metadata["id-0"] = map[string]string{}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		LandbSetNodes: []provider.NodeInfo{{Name: "node-0", LandbSet: "set-a,set-b,set-c"}},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "set-a,set-b,set-c", mock.updatedMetadata["id-0"][landbSetMetadataKey])
+}
+
+func TestSync_UpdatesLandbSetMetadata(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["node-0"] = "id-0"
+	mock.metadata["id-0"] = map[string]string{
+		landbSetMetadataKey: "oldset",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		LandbSetNodes: []provider.NodeInfo{{Name: "node-0", LandbSet: "mylandbset"}},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "mylandbset", mock.updatedMetadata["id-0"][landbSetMetadataKey])
+	assert.Empty(t, mock.deletedKeys)
+}
+
+func TestSync_DeletesLandbSetMetadataWhenAnnotationMissing(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["node-0"] = "id-0"
+	mock.metadata["id-0"] = map[string]string{
+		landbSetMetadataKey: "oldset",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		StaleLandbSetNodes: []provider.NodeInfo{{Name: "node-0"}},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.deletedKeys, "id-0:"+landbSetMetadataKey)
+}
+
+func TestSync_DeletesLandbSetMetadataWhenNodeNotReady(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["node-0"] = "id-0"
+	mock.metadata["id-0"] = map[string]string{
+		landbSetMetadataKey: "oldset",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		StaleLandbSetNodes: []provider.NodeInfo{{Name: "node-0", LandbSet: "mylandbset"}},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.deletedKeys, "id-0:"+landbSetMetadataKey)
 }
 
 func TestSync_AggregatesErrors(t *testing.T) {
@@ -208,9 +285,9 @@ func TestSync_AggregatesErrors(t *testing.T) {
 	mock.serverIDs = map[string]string{"node-a": "id-a"}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
+	err := p.Sync(context.Background(), provider.DesiredState{
 		Aliases: []string{"app1"},
-		Nodes: []provider.NodeInfo{
+		IngressNodes: []provider.NodeInfo{
 			{Name: "node-a"},
 			{Name: "node-b"},
 		},
@@ -230,17 +307,17 @@ func TestSync_UpdateMetadataError(t *testing.T) {
 	mock.updateMetadataErr = errors.New("API error")
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{"app1"},
+		IngressNodes: []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updating metadata")
 }
 
-// --- StaleNodes cleanup tests ---
+// --- StaleAliasNodes cleanup tests ---
 
-func TestSync_CleansStaleNodes(t *testing.T) {
+func TestSync_CleansStaleAliasNodes(t *testing.T) {
 	mock := newMockCompute()
 	mock.serverIDs["stale-node"] = "id-stale"
 	mock.metadata["id-stale"] = map[string]string{
@@ -250,9 +327,9 @@ func TestSync_CleansStaleNodes(t *testing.T) {
 	}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases:    []string{"app1"},
-		StaleNodes: []provider.NodeInfo{{Name: "stale-node"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:         []string{"app1"},
+		StaleAliasNodes: []provider.NodeInfo{{Name: "stale-node"}},
 	})
 	require.NoError(t, err)
 
@@ -272,11 +349,47 @@ func TestSync_StaleNodeWithoutMetadata_NoOp(t *testing.T) {
 	}
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		StaleNodes: []provider.NodeInfo{{Name: "clean-node"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		StaleAliasNodes: []provider.NodeInfo{{Name: "clean-node"}},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, mock.deletedKeys)
+}
+
+func TestSync_StaleNodeKeepsAnnotatedLandbSet(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["stale-node"] = "id-stale"
+	mock.metadata["id-stale"] = map[string]string{
+		"landb-alias":       "old-app--load-0-",
+		landbSetMetadataKey: "oldset",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		StaleAliasNodes: []provider.NodeInfo{{Name: "stale-node"}},
+		LandbSetNodes:   []provider.NodeInfo{{Name: "stale-node", LandbSet: "mylandbset"}},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "mylandbset", mock.updatedMetadata["id-stale"][landbSetMetadataKey])
+	assert.Contains(t, mock.deletedKeys, "id-stale:landb-alias")
+	assert.NotContains(t, mock.deletedKeys, "id-stale:"+landbSetMetadataKey)
+}
+
+func TestSync_StaleNodeDeletesLandbSetWhenAnnotationMissing(t *testing.T) {
+	mock := newMockCompute()
+	mock.serverIDs["stale-node"] = "id-stale"
+	mock.metadata["id-stale"] = map[string]string{
+		landbSetMetadataKey: "oldset",
+	}
+
+	p := newTestProvider(mock)
+	err := p.Sync(context.Background(), provider.DesiredState{
+		StaleLandbSetNodes: []provider.NodeInfo{{Name: "stale-node"}},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.deletedKeys, "id-stale:"+landbSetMetadataKey)
 }
 
 func TestSync_StaleNodeError_Aggregated(t *testing.T) {
@@ -287,14 +400,14 @@ func TestSync_StaleNodeError_Aggregated(t *testing.T) {
 	// Stale node fails to resolve.
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases:    []string{"app1"},
-		Nodes:      []provider.NodeInfo{{Name: "node-a"}},
-		StaleNodes: []provider.NodeInfo{{Name: "missing-node"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:         []string{"app1"},
+		IngressNodes:    []provider.NodeInfo{{Name: "node-a"}},
+		StaleAliasNodes: []provider.NodeInfo{{Name: "missing-node"}},
 	})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "stale node missing-node")
+	assert.Contains(t, err.Error(), "stale alias node missing-node")
 	// Ingress node should still have been synced.
 	assert.NotEmpty(t, mock.updatedMetadata["id-a"])
 }
@@ -389,9 +502,9 @@ func TestSync_DeleteMetadatumError(t *testing.T) {
 	mock.deleteMetadatumErr = errors.New("delete failed")
 
 	p := newTestProvider(mock)
-	err := p.Sync(context.Background(), provider.AliasSet{
-		Aliases: []string{"app1"},
-		Nodes:   []provider.NodeInfo{{Name: "node-0"}},
+	err := p.Sync(context.Background(), provider.DesiredState{
+		Aliases:      []string{"app1"},
+		IngressNodes: []provider.NodeInfo{{Name: "node-0"}},
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deleting key")

@@ -167,52 +167,68 @@ func (p *Provider) ZeroPassword() {
 
 // --- provider.Provider implementation ---
 
-// Sync reconciles the OpenStack server metadata for all nodes in the
-// desired AliasSet.
+// Sync reconciles OpenStack server metadata to match the desired state.
 //
-// For each node (at index i in the sorted node list):
-//  1. Compute desired metadata by appending --load-i- to each alias
-//     and packing them into metadata keys.
-//  2. Read the node's current metadata from OpenStack.
-//  3. Diff: identify keys to create/update and stale keys to delete.
-//  4. Apply changes via the OpenStack API.
-//
-// All nodes are attempted even if some fail; errors are aggregated.
-func (p *Provider) Sync(ctx context.Context, desired provider.AliasSet) error {
-	log := p.log.WithValues("aliases", len(desired.Aliases), "nodes", len(desired.Nodes))
-	log.Info("Starting alias synchronization")
+// Alias metadata and landb-set metadata are reconciled independently so any
+// node can carry a landb-set value, regardless of ingress membership.
+func (p *Provider) Sync(ctx context.Context, desired provider.DesiredState) error {
+	log := p.log.WithValues(
+		"aliases", len(desired.Aliases),
+		"ingressNodes", len(desired.IngressNodes),
+		"staleAliasNodes", len(desired.StaleAliasNodes),
+		"landbSetNodes", len(desired.LandbSetNodes),
+		"staleLandbSetNodes", len(desired.StaleLandbSetNodes),
+	)
+	log.Info("Starting metadata synchronization")
 
 	var errs []error
 
-	for i, node := range desired.Nodes {
-		nodeLog := log.WithValues("node", node.Name, "index", i)
-		if err := p.syncNode(ctx, nodeLog, node, i, desired.Aliases); err != nil {
-			nodeLog.Error(err, "Failed to sync node")
-			errs = append(errs, fmt.Errorf("node %s: %w", node.Name, err))
+	for i, node := range desired.IngressNodes {
+		nodeLog := log.WithValues("node", node.Name, "index", i, "metadata", "landb-alias")
+		if err := p.syncAliasNode(ctx, nodeLog, node, i, desired.Aliases); err != nil {
+			nodeLog.Error(err, "Failed to sync alias metadata")
+			errs = append(errs, fmt.Errorf("alias node %s: %w", node.Name, err))
 		}
 	}
 
 	// Clean up landb-alias metadata from nodes that are no longer ingress.
-	for _, node := range desired.StaleNodes {
-		nodeLog := log.WithValues("node", node.Name, "stale", true)
-		if err := p.cleanupNode(ctx, nodeLog, node); err != nil {
-			nodeLog.Error(err, "Failed to cleanup stale node")
-			errs = append(errs, fmt.Errorf("stale node %s: %w", node.Name, err))
+	for _, node := range desired.StaleAliasNodes {
+		nodeLog := log.WithValues("node", node.Name, "metadata", "landb-alias", "stale", true)
+		if err := p.cleanupAliasNode(ctx, nodeLog, node); err != nil {
+			nodeLog.Error(err, "Failed to cleanup stale alias metadata")
+			errs = append(errs, fmt.Errorf("stale alias node %s: %w", node.Name, err))
 		}
 	}
 
-	totalNodes := len(desired.Nodes) + len(desired.StaleNodes)
+	for _, node := range desired.LandbSetNodes {
+		nodeLog := log.WithValues("node", node.Name, "metadata", "landb-set")
+		if err := p.syncLandbSetNode(ctx, nodeLog, node); err != nil {
+			nodeLog.Error(err, "Failed to sync landb-set metadata")
+			errs = append(errs, fmt.Errorf("landb-set node %s: %w", node.Name, err))
+		}
+	}
+
+	for _, node := range desired.StaleLandbSetNodes {
+		nodeLog := log.WithValues("node", node.Name, "metadata", "landb-set", "stale", true)
+		if err := p.cleanupLandbSetNode(ctx, nodeLog, node); err != nil {
+			nodeLog.Error(err, "Failed to cleanup stale landb-set metadata")
+			errs = append(errs, fmt.Errorf("stale landb-set node %s: %w", node.Name, err))
+		}
+	}
+
+	totalNodes := len(desired.IngressNodes) + len(desired.StaleAliasNodes) +
+		len(desired.LandbSetNodes) + len(desired.StaleLandbSetNodes)
 	if len(errs) > 0 {
-		return fmt.Errorf("sync failed for %d/%d nodes: %w",
+		return fmt.Errorf("sync failed for %d/%d node operations: %w",
 			len(errs), totalNodes, errors.Join(errs...))
 	}
 
-	log.Info("Alias synchronization completed successfully")
+	log.Info("Metadata synchronization completed successfully")
 	return nil
 }
 
-// syncNode reconciles metadata for a single node.
-func (p *Provider) syncNode(
+// syncAliasNode reconciles landb-alias metadata for a single ingress node.
+func (p *Provider) syncAliasNode(
 	ctx context.Context,
 	log logr.Logger,
 	node provider.NodeInfo,
@@ -250,7 +266,7 @@ func (p *Provider) syncNode(
 		}
 	}
 
-	// Step 5: Diff — find stale landb-alias keys to delete.
+	// Step 5: Diff — find stale metadata keys to delete.
 	var toDelete []string
 	for key := range currentMeta {
 		if !strings.HasPrefix(key, landbAliasPrefix) {
@@ -290,9 +306,9 @@ func (p *Provider) syncNode(
 	return nil
 }
 
-// cleanupNode removes all landb-alias metadata from a node that is no
+// cleanupAliasNode removes all landb-alias metadata from a node that is no
 // longer serving ingress traffic.
-func (p *Provider) cleanupNode(
+func (p *Provider) cleanupAliasNode(
 	ctx context.Context,
 	log logr.Logger,
 	node provider.NodeInfo,
@@ -317,13 +333,9 @@ func (p *Provider) cleanupNode(
 		}
 	}
 
-	if len(toDelete) == 0 {
-		log.V(1).Info("No landb-alias metadata found, nothing to clean")
-		return nil
+	if len(toDelete) > 0 {
+		log.Info("Removing stale landb-alias metadata", "keys", len(toDelete))
 	}
-
-	// Step 4: Delete all landb-alias keys.
-	log.Info("Removing stale landb-alias metadata", "keys", len(toDelete))
 	var deleteErrs []error
 	for _, key := range toDelete {
 		if err := p.deleteMetadatumInstrumented(ctx, serverID, key); err != nil {
@@ -336,7 +348,94 @@ func (p *Provider) cleanupNode(
 		return errors.Join(deleteErrs...)
 	}
 
+	if len(toDelete) == 0 {
+		log.V(1).Info("No changes needed")
+	}
+
 	return nil
+}
+
+func (p *Provider) syncLandbSetNode(ctx context.Context, log logr.Logger, node provider.NodeInfo) error {
+	serverID, err := p.getServerIDInstrumented(ctx, node.Name)
+	if err != nil {
+		return fmt.Errorf("resolving server ID: %w", err)
+	}
+	log.V(1).Info("Resolved server ID", "serverID", serverID)
+
+	currentMeta, err := p.getMetadataInstrumented(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("reading metadata: %w", err)
+	}
+
+	toUpdate := make(map[string]string)
+	reconcileLandbSet(log, node, currentMeta, toUpdate)
+	if len(toUpdate) == 0 {
+		log.V(1).Info("No changes needed")
+		return nil
+	}
+
+	if err := p.updateMetadataInstrumented(ctx, serverID, toUpdate); err != nil {
+		return fmt.Errorf("updating metadata: %w", err)
+	}
+	log.Info("Updated metadata keys", "count", len(toUpdate))
+	return nil
+}
+
+func (p *Provider) cleanupLandbSetNode(ctx context.Context, log logr.Logger, node provider.NodeInfo) error {
+	serverID, err := p.getServerIDInstrumented(ctx, node.Name)
+	if err != nil {
+		return fmt.Errorf("resolving server ID: %w", err)
+	}
+	log.V(1).Info("Resolved server ID", "serverID", serverID)
+
+	currentMeta, err := p.getMetadataInstrumented(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("reading metadata: %w", err)
+	}
+
+	var toDelete []string
+	reconcileStaleLandbSet(log, currentMeta, &toDelete)
+	if len(toDelete) == 0 {
+		log.V(1).Info("No changes needed")
+		return nil
+	}
+
+	var deleteErrs []error
+	for _, key := range toDelete {
+		if err := p.deleteMetadatumInstrumented(ctx, serverID, key); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("deleting key %q: %w", key, err))
+		} else {
+			log.Info("Deleted stale metadata key", "key", key)
+		}
+	}
+	return errors.Join(deleteErrs...)
+}
+
+func reconcileLandbSet(
+	log logr.Logger,
+	node provider.NodeInfo,
+	currentMeta map[string]string,
+	toUpdate map[string]string,
+) {
+	if node.LandbSet == "" {
+		return
+	}
+	if currentVal, exists := currentMeta[landbSetMetadataKey]; !exists || currentVal != node.LandbSet {
+		log.Info("Metadata key needs update", "key", landbSetMetadataKey,
+			"current", currentMeta[landbSetMetadataKey], "desired", node.LandbSet)
+		toUpdate[landbSetMetadataKey] = node.LandbSet
+	}
+}
+
+func reconcileStaleLandbSet(
+	log logr.Logger,
+	currentMeta map[string]string,
+	toDelete *[]string,
+) {
+	if _, exists := currentMeta[landbSetMetadataKey]; exists {
+		log.Info("Stale metadata key will be deleted", "key", landbSetMetadataKey)
+		*toDelete = append(*toDelete, landbSetMetadataKey)
+	}
 }
 
 // --- Instrumented API wrappers ---

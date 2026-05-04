@@ -42,6 +42,9 @@ const (
 	// defaultIngressNodeLabels are the Kubernetes labels used to identify
 	// nodes serving ingress traffic (comma-separated).
 	defaultIngressNodeLabels = "node-role.kubernetes.io/ingress,role=ingress"
+	// landbMetadataPrefix identifies Kubernetes labels and annotations that
+	// should trigger LANDB metadata reconciliation.
+	landbMetadataPrefix = "landb.cern.ch/"
 )
 
 var scheme = runtime.NewScheme()
@@ -63,9 +66,9 @@ func main() {
 func run() error {
 	// --- Flags ---
 	var (
-		providerName        string
-		ingressNodeLabels   string
-		cloudConfigSecret   string
+		providerName      string
+		ingressNodeLabels string
+		cloudConfigSecret string
 	)
 	flag.StringVar(&providerName, "provider", providerOpenStack,
 		"DNS provider to use (currently only 'openstack').")
@@ -198,10 +201,10 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabels
 		return false
 	}
 
-	// labelPredicate filters Node events to those that have (or had) the
+	// ingressPredicate filters Node events to those that have (or had) the
 	// ingress node label. For Update events, it checks both the old and
 	// new object so that label removal also triggers reconciliation.
-	labelPredicate := predicate.Funcs{
+	ingressPredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			return hasIngressLabel(e.Object)
 		},
@@ -230,12 +233,31 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabels
 		},
 	}
 
+	// landbMetadataPredicate triggers reconciliation when any LANDB-owned node
+	// label or annotation is added, removed, or changed. This covers nodes that
+	// are not ingress nodes, because landb-set metadata is independent from
+	// alias membership.
+	landbMetadataPredicate := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return hasLandbMetadata(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return landbMetadataChanged(e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return hasLandbMetadata(e.Object)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return hasLandbMetadata(e.Object)
+		},
+	}
+
 	return builder.ControllerManagedBy(mgr).
 		// Reconcile on any Ingress change across all namespaces.
 		For(&networkingv1.Ingress{}).
-		// Reconcile on changes to ingress-labeled Nodes. All node events
-		// map to the same reconcile key to avoid thundering herd when
-		// multiple nodes change simultaneously.
+		// Reconcile on relevant Node changes. All node events map to the same
+		// reconcile key to avoid thundering herd when multiple nodes change
+		// simultaneously.
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(
 				func(_ context.Context, _ client.Object) []reconcile.Request {
@@ -244,7 +266,49 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabels
 					}}
 				},
 			),
-			builder.WithPredicates(predicate.Or(labelPredicate, statusChangedPredicate)),
+			builder.WithPredicates(predicate.Or(ingressPredicate, statusChangedPredicate, landbMetadataPredicate)),
 		).
 		Complete(reconciler)
+}
+
+func hasLandbMetadata(obj client.Object) bool {
+	return hasPrefixedKey(obj.GetLabels(), landbMetadataPrefix) ||
+		hasPrefixedKey(obj.GetAnnotations(), landbMetadataPrefix)
+}
+
+func landbMetadataChanged(oldObj, newObj client.Object) bool {
+	return prefixedMapChanged(oldObj.GetLabels(), newObj.GetLabels(), landbMetadataPrefix) ||
+		prefixedMapChanged(oldObj.GetAnnotations(), newObj.GetAnnotations(), landbMetadataPrefix)
+}
+
+func hasPrefixedKey(values map[string]string, prefix string) bool {
+	for key := range values {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func prefixedMapChanged(oldValues, newValues map[string]string, prefix string) bool {
+	keys := make(map[string]struct{})
+	for key := range oldValues {
+		if strings.HasPrefix(key, prefix) {
+			keys[key] = struct{}{}
+		}
+	}
+	for key := range newValues {
+		if strings.HasPrefix(key, prefix) {
+			keys[key] = struct{}{}
+		}
+	}
+
+	for key := range keys {
+		oldValue, hadOldValue := oldValues[key]
+		newValue, hasNewValue := newValues[key]
+		if hadOldValue != hasNewValue || oldValue != newValue {
+			return true
+		}
+	}
+	return false
 }

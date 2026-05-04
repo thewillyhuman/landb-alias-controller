@@ -20,11 +20,11 @@ import (
 // --- mockProvider: test double for provider.Provider ---
 
 type mockProvider struct {
-	lastDesired *provider.AliasSet
+	lastDesired *provider.DesiredState
 	syncErr     error
 }
 
-func (m *mockProvider) Sync(_ context.Context, desired provider.AliasSet) error {
+func (m *mockProvider) Sync(_ context.Context, desired provider.DesiredState) error {
 	m.lastDesired = &desired
 	return m.syncErr
 }
@@ -68,6 +68,11 @@ func withReadyCondition(node *v1.Node, status v1.ConditionStatus) *v1.Node {
 		Type:   v1.NodeReady,
 		Status: status,
 	})
+	return node
+}
+
+func withAnnotations(node *v1.Node, annotations map[string]string) *v1.Node {
+	node.Annotations = annotations
 	return node
 }
 
@@ -160,9 +165,9 @@ func TestListAliases_MultipleRulesPerIngress(t *testing.T) {
 	assert.Equal(t, []string{"app1", "app2"}, aliases)
 }
 
-// --- listNodes tests ---
+// --- listIngressNodes tests ---
 
-func TestListNodes_FiltersAndSortsByName(t *testing.T) {
+func TestListIngressNodes_FiltersAndSortsByName(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-b", map[string]string{label: ""}, "2.2.2.2", "10.0.0.2"), v1.ConditionTrue),
@@ -171,7 +176,7 @@ func TestListNodes_FiltersAndSortsByName(t *testing.T) {
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 
 	require.Len(t, nodes, 2)
@@ -179,22 +184,133 @@ func TestListNodes_FiltersAndSortsByName(t *testing.T) {
 	assert.Equal(t, "node-b", nodes[1].Name)
 }
 
-func TestListNodes_IncludesNodesWithoutIP(t *testing.T) {
+func TestListIngressNodes_IncludesNodesWithoutIP(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "", ""), v1.ConditionTrue),
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
 	assert.Equal(t, "node-a", nodes[0].Name)
 }
 
+func TestListIngressNodes_IncludesLandbSetAnnotation(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(withAnnotations(
+			makeNode("node-a", map[string]string{label: ""}, "", ""),
+			map[string]string{landbSetAnnotation: "mylandbset"},
+		), v1.ConditionTrue),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
+	nodes, err := c.listIngressNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "node-a", nodes[0].Name)
+	assert.Equal(t, "mylandbset", nodes[0].LandbSet)
+}
+
+func TestListIngressNodes_NormalizesCommaSeparatedLandbSetAnnotation(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(withAnnotations(
+			makeNode("node-a", map[string]string{label: ""}, "", ""),
+			map[string]string{landbSetAnnotation: "set-a, set-b,,set-c , set-a"},
+		), v1.ConditionTrue),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
+	nodes, err := c.listIngressNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "set-a,set-b,set-c", nodes[0].LandbSet)
+}
+
+func TestListIngressNodes_FallsBackToLandbSetLabel(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(
+			makeNode("node-a", map[string]string{
+				label:         "",
+				landbSetLabel: "labelset",
+			}, "", ""),
+			v1.ConditionTrue,
+		),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
+	nodes, err := c.listIngressNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "labelset", nodes[0].LandbSet)
+}
+
+func TestListIngressNodes_LandbSetAnnotationOverridesLabel(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(withAnnotations(
+			makeNode("node-a", map[string]string{
+				label:         "",
+				landbSetLabel: "labelset",
+			}, "", ""),
+			map[string]string{landbSetAnnotation: "annotationset"},
+		), v1.ConditionTrue),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
+	nodes, err := c.listIngressNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "annotationset", nodes[0].LandbSet)
+}
+
+func TestListIngressNodes_TrimsEmptyLandbSetAnnotation(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(withAnnotations(
+			makeNode("node-a", map[string]string{label: ""}, "", ""),
+			map[string]string{landbSetAnnotation: " \t "},
+		), v1.ConditionTrue),
+	).Build()
+
+	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
+	nodes, err := c.listIngressNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "", nodes[0].LandbSet)
+}
+
+func TestNormalizeLandbSet(t *testing.T) {
+	assert.Equal(t, "", normalizeLandbSet(""))
+	assert.Equal(t, "", normalizeLandbSet(" ,\t, "))
+	assert.Equal(t, "set-a", normalizeLandbSet(" set-a "))
+	assert.Equal(t, "set-a,set-b,set-c", normalizeLandbSet("set-a, set-b,,set-c,set-b"))
+}
+
+func TestListAllNodes_IncludesLandbSetForNonIngressNodes(t *testing.T) {
+	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(withAnnotations(
+			makeNode("node-a", map[string]string{"other": "label"}, "", ""),
+			map[string]string{landbSetAnnotation: "mylandbset"},
+		), v1.ConditionTrue),
+	).Build()
+
+	c := &Controller{Client: client}
+	nodes, err := c.listAllNodes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "node-a", nodes[0].Name)
+	assert.True(t, nodes[0].Ready)
+	assert.Equal(t, "mylandbset", nodes[0].LandbSet)
+}
+
 // --- runOnce integration test ---
 
-func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
+func TestRunOnce_BuildsCorrectDesiredState(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app1.cern.ch"),
@@ -215,10 +331,14 @@ func TestRunOnce_BuildsCorrectAliasSet(t *testing.T) {
 
 	require.NotNil(t, mock.lastDesired)
 	assert.Equal(t, []string{"app1", "app2"}, mock.lastDesired.Aliases)
-	require.Len(t, mock.lastDesired.Nodes, 2)
-	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name) // Sorted.
-	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
-	assert.Empty(t, mock.lastDesired.StaleNodes)
+	require.Len(t, mock.lastDesired.IngressNodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.IngressNodes[0].Name) // Sorted.
+	assert.Equal(t, "node-b", mock.lastDesired.IngressNodes[1].Name)
+	assert.Empty(t, mock.lastDesired.StaleAliasNodes)
+	assert.Empty(t, mock.lastDesired.LandbSetNodes)
+	require.Len(t, mock.lastDesired.StaleLandbSetNodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.StaleLandbSetNodes[0].Name)
+	assert.Equal(t, "node-b", mock.lastDesired.StaleLandbSetNodes[1].Name)
 }
 
 func TestRunOnce_PropagatesProviderError(t *testing.T) {
@@ -240,7 +360,7 @@ func TestRunOnce_PropagatesProviderError(t *testing.T) {
 	assert.Contains(t, err.Error(), "sync failed")
 }
 
-func TestRunOnce_IdentifiesStaleNodes(t *testing.T) {
+func TestRunOnce_IdentifiesStaleAliasNodes(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app.cern.ch"),
@@ -261,16 +381,82 @@ func TestRunOnce_IdentifiesStaleNodes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, mock.lastDesired)
 
-	require.Len(t, mock.lastDesired.Nodes, 2)
-	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name)
-	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
+	require.Len(t, mock.lastDesired.IngressNodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.IngressNodes[0].Name)
+	assert.Equal(t, "node-b", mock.lastDesired.IngressNodes[1].Name)
 
-	require.Len(t, mock.lastDesired.StaleNodes, 2)
-	assert.Equal(t, "node-c", mock.lastDesired.StaleNodes[0].Name)
-	assert.Equal(t, "node-d", mock.lastDesired.StaleNodes[1].Name)
+	require.Len(t, mock.lastDesired.StaleAliasNodes, 2)
+	assert.Equal(t, "node-c", mock.lastDesired.StaleAliasNodes[0].Name)
+	assert.Equal(t, "node-d", mock.lastDesired.StaleAliasNodes[1].Name)
 }
 
-func TestRunOnce_AllNodesIngress_NoStaleNodes(t *testing.T) {
+func TestRunOnce_IdentifiesLandbSetNodesSeparatelyFromIngressNodes(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		makeIngress("ing-1", "default", "app.cern.ch"),
+		withReadyCondition(makeNode("ingress-node", map[string]string{label: ""}, "", ""), v1.ConditionTrue),
+		withReadyCondition(withAnnotations(
+			makeNode("landb-set-node", map[string]string{"other": "label"}, "", ""),
+			map[string]string{landbSetAnnotation: "mylandbset"},
+		), v1.ConditionTrue),
+		makeNode("plain-node", nil, "", ""),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:            k8sClient,
+		Provider:          mock,
+		IngressNodeLabels: []LabelSelector{{Key: label}},
+	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+
+	require.Len(t, mock.lastDesired.IngressNodes, 1)
+	assert.Equal(t, "ingress-node", mock.lastDesired.IngressNodes[0].Name)
+
+	require.Len(t, mock.lastDesired.StaleAliasNodes, 2)
+	assert.Equal(t, "landb-set-node", mock.lastDesired.StaleAliasNodes[0].Name)
+	assert.Equal(t, "plain-node", mock.lastDesired.StaleAliasNodes[1].Name)
+
+	require.Len(t, mock.lastDesired.LandbSetNodes, 1)
+	assert.Equal(t, "landb-set-node", mock.lastDesired.LandbSetNodes[0].Name)
+	assert.Equal(t, "mylandbset", mock.lastDesired.LandbSetNodes[0].LandbSet)
+
+	require.Len(t, mock.lastDesired.StaleLandbSetNodes, 2)
+	assert.Equal(t, "ingress-node", mock.lastDesired.StaleLandbSetNodes[0].Name)
+	assert.Equal(t, "plain-node", mock.lastDesired.StaleLandbSetNodes[1].Name)
+}
+
+func TestRunOnce_NotReadyLandbSetNodeIsStale(t *testing.T) {
+	label := "node-role.kubernetes.io/ingress"
+	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
+		withReadyCondition(makeNode("ingress-node", map[string]string{label: ""}, "", ""), v1.ConditionTrue),
+		withReadyCondition(withAnnotations(
+			makeNode("unhealthy-landb-set-node", map[string]string{"other": "label"}, "", ""),
+			map[string]string{landbSetAnnotation: "mylandbset"},
+		), v1.ConditionFalse),
+	).Build()
+
+	mock := &mockProvider{}
+	c := &Controller{
+		Client:            k8sClient,
+		Provider:          mock,
+		IngressNodeLabels: []LabelSelector{{Key: label}},
+	}
+
+	err := c.runOnce(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastDesired)
+
+	assert.Empty(t, mock.lastDesired.LandbSetNodes)
+	require.Len(t, mock.lastDesired.StaleLandbSetNodes, 2)
+	assert.Equal(t, "ingress-node", mock.lastDesired.StaleLandbSetNodes[0].Name)
+	assert.Equal(t, "unhealthy-landb-set-node", mock.lastDesired.StaleLandbSetNodes[1].Name)
+}
+
+func TestRunOnce_AllNodesIngress_NoStaleAliasNodes(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	k8sClient := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		makeIngress("ing-1", "default", "app.cern.ch"),
@@ -288,8 +474,8 @@ func TestRunOnce_AllNodesIngress_NoStaleNodes(t *testing.T) {
 	err := c.runOnce(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, mock.lastDesired)
-	require.Len(t, mock.lastDesired.Nodes, 2)
-	assert.Empty(t, mock.lastDesired.StaleNodes)
+	require.Len(t, mock.lastDesired.IngressNodes, 2)
+	assert.Empty(t, mock.lastDesired.StaleAliasNodes)
 }
 
 func TestRunOnce_EmptyCluster(t *testing.T) {
@@ -305,12 +491,12 @@ func TestRunOnce_EmptyCluster(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, mock.lastDesired)
 	assert.Empty(t, mock.lastDesired.Aliases)
-	assert.Empty(t, mock.lastDesired.Nodes)
+	assert.Empty(t, mock.lastDesired.IngressNodes)
 }
 
 // --- NotReady node tests ---
 
-func TestListNodes_ExcludesNotReadyNodes(t *testing.T) {
+func TestListIngressNodes_ExcludesNotReadyNodes(t *testing.T) {
 	label := "node-role.kubernetes.io/ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-a", map[string]string{label: ""}, "1.1.1.1", ""), v1.ConditionTrue),
@@ -319,7 +505,7 @@ func TestListNodes_ExcludesNotReadyNodes(t *testing.T) {
 	).Build()
 
 	c := &Controller{Client: client, IngressNodeLabels: []LabelSelector{{Key: label}}}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
 	assert.Equal(t, "node-a", nodes[0].Name)
@@ -346,18 +532,18 @@ func TestRunOnce_NotReadyIngressNodeIsStale(t *testing.T) {
 	require.NotNil(t, mock.lastDesired)
 
 	// Only node-a is Ready and has the ingress label.
-	require.Len(t, mock.lastDesired.Nodes, 1)
-	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name)
+	require.Len(t, mock.lastDesired.IngressNodes, 1)
+	assert.Equal(t, "node-a", mock.lastDesired.IngressNodes[0].Name)
 
 	// node-b (ingress but NotReady) and node-c (non-ingress) are stale.
-	require.Len(t, mock.lastDesired.StaleNodes, 2)
-	assert.Equal(t, "node-b", mock.lastDesired.StaleNodes[0].Name)
-	assert.Equal(t, "node-c", mock.lastDesired.StaleNodes[1].Name)
+	require.Len(t, mock.lastDesired.StaleAliasNodes, 2)
+	assert.Equal(t, "node-b", mock.lastDesired.StaleAliasNodes[0].Name)
+	assert.Equal(t, "node-c", mock.lastDesired.StaleAliasNodes[1].Name)
 }
 
 // --- Multi-label tests ---
 
-func TestListNodes_MultipleLabels_ORLogic(t *testing.T) {
+func TestListIngressNodes_MultipleLabels_ORLogic(t *testing.T) {
 	ingress := "ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-a", map[string]string{"node-role.kubernetes.io/ingress": ""}, "1.1.1.1", ""), v1.ConditionTrue),
@@ -372,14 +558,14 @@ func TestListNodes_MultipleLabels_ORLogic(t *testing.T) {
 			{Key: "role", Value: &ingress},
 		},
 	}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 2)
 	assert.Equal(t, "node-a", nodes[0].Name)
 	assert.Equal(t, "node-b", nodes[1].Name)
 }
 
-func TestListNodes_MultipleLabels_DeduplicatesNodes(t *testing.T) {
+func TestListIngressNodes_MultipleLabels_DeduplicatesNodes(t *testing.T) {
 	ingress := "ingress"
 	// A node with both labels should appear only once.
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
@@ -396,13 +582,13 @@ func TestListNodes_MultipleLabels_DeduplicatesNodes(t *testing.T) {
 			{Key: "role", Value: &ingress},
 		},
 	}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
 	assert.Equal(t, "node-a", nodes[0].Name)
 }
 
-func TestListNodes_KeyValueLabel_IgnoresWrongValue(t *testing.T) {
+func TestListIngressNodes_KeyValueLabel_IgnoresWrongValue(t *testing.T) {
 	ingress := "ingress"
 	client := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(
 		withReadyCondition(makeNode("node-a", map[string]string{"role": "ingress"}, "1.1.1.1", ""), v1.ConditionTrue),
@@ -413,7 +599,7 @@ func TestListNodes_KeyValueLabel_IgnoresWrongValue(t *testing.T) {
 		Client:            client,
 		IngressNodeLabels: []LabelSelector{{Key: "role", Value: &ingress}},
 	}
-	nodes, err := c.listNodes(context.Background())
+	nodes, err := c.listIngressNodes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
 	assert.Equal(t, "node-a", nodes[0].Name)
@@ -442,13 +628,13 @@ func TestRunOnce_MultipleLabels_AllIngress(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, mock.lastDesired)
 
-	require.Len(t, mock.lastDesired.Nodes, 2)
-	assert.Equal(t, "node-a", mock.lastDesired.Nodes[0].Name)
-	assert.Equal(t, "node-b", mock.lastDesired.Nodes[1].Name)
+	require.Len(t, mock.lastDesired.IngressNodes, 2)
+	assert.Equal(t, "node-a", mock.lastDesired.IngressNodes[0].Name)
+	assert.Equal(t, "node-b", mock.lastDesired.IngressNodes[1].Name)
 
 	// node-c is the only stale node.
-	require.Len(t, mock.lastDesired.StaleNodes, 1)
-	assert.Equal(t, "node-c", mock.lastDesired.StaleNodes[0].Name)
+	require.Len(t, mock.lastDesired.StaleAliasNodes, 1)
+	assert.Equal(t, "node-c", mock.lastDesired.StaleAliasNodes[0].Name)
 }
 
 func TestParseLabelSelector_KeyOnly(t *testing.T) {

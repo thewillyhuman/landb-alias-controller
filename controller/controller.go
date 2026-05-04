@@ -2,7 +2,7 @@
 // watches Ingress and Node resources and drives DNS alias synchronization
 // via a provider.Provider.
 //
-// The controller is provider-agnostic: it builds an AliasSet describing
+// The controller is provider-agnostic: it builds a DesiredState describing
 // what aliases should exist and which nodes should serve them, then
 // delegates all infrastructure interaction to the provider.
 package controller
@@ -27,6 +27,14 @@ import (
 const (
 	// cernChSuffix is the DNS suffix used to identify CERN-managed domains.
 	cernChSuffix = ".cern.ch"
+
+	// landbSetAnnotation is the node annotation used to declare the desired
+	// OpenStack landb-set metadata value.
+	landbSetAnnotation = "landb.cern.ch/set"
+
+	// landbSetLabel is accepted for compatibility with clusters that already
+	// model a single landb-set value as a node label.
+	landbSetLabel = "landb.cern.ch/set"
 
 	// requeueDelay is the delay before retrying after a failed reconciliation.
 	// OpenStack errors can be transient, so we retry instead of giving up.
@@ -115,7 +123,7 @@ func (c *Controller) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 // runOnce performs a single full reconciliation cycle:
 //  1. List all CERN aliases from Ingress resources.
 //  2. List all ingress-labeled nodes.
-//  3. Build the AliasSet and pass it to the provider.
+//  3. Build the DesiredState and pass it to the provider.
 func (c *Controller) runOnce(ctx context.Context) error {
 	log := log.FromContext(ctx)
 
@@ -127,48 +135,61 @@ func (c *Controller) runOnce(ctx context.Context) error {
 	log.V(1).Info("Desired aliases", "count", len(aliases), "aliases", aliases)
 	metrics.AliasesDesired.Set(float64(len(aliases)))
 
-	// Step 2: Collect ingress nodes.
-	nodes, err := c.listNodes(ctx)
+	// Step 2: Collect Ready ingress nodes for alias metadata.
+	ingressNodes, err := c.listIngressNodes(ctx)
 	if err != nil {
-		return fmt.Errorf("listing nodes: %w", err)
+		return fmt.Errorf("listing ingress nodes: %w", err)
 	}
-	log.V(1).Info("Ingress nodes", "count", len(nodes))
-	for _, n := range nodes {
-		log.V(1).Info("  Node", "name", n.Name)
+	log.Info("Ingress nodes", "count", len(ingressNodes))
+	for _, n := range ingressNodes {
+		log.V(1).Info("  Ingress node", "name", n.Name)
 	}
-	metrics.NodesManaged.Set(float64(len(nodes)))
+	metrics.IngressNodesManaged.Set(float64(len(ingressNodes)))
 
-	if len(nodes) == 0 {
+	if len(ingressNodes) == 0 {
 		log.Info("No ingress nodes found; desired state is empty")
 	}
 	if len(aliases) == 0 {
 		log.Info("No CERN aliases found in Ingress resources")
 	}
 
-	// Step 3: Identify stale nodes (non-ingress nodes that may carry
-	// leftover landb-alias metadata).
+	// Step 3: Collect all nodes so alias cleanup and landb-set metadata can
+	// be reconciled independently from ingress membership.
 	allNodes, err := c.listAllNodes(ctx)
 	if err != nil {
 		return fmt.Errorf("listing all nodes: %w", err)
 	}
+	metrics.NodesManaged.Set(float64(len(allNodes)))
 
-	ingressSet := make(map[string]struct{}, len(nodes))
-	for _, n := range nodes {
-		ingressSet[n.Name] = struct{}{}
+	staleAliasNodes := buildStaleAliasNodes(allNodes, ingressNodes)
+	log.Info("Stale alias nodes", "count", len(staleAliasNodes))
+	for _, n := range staleAliasNodes {
+		log.V(1).Info("  Stale alias node", "name", n.Name)
 	}
-	var staleNodes []provider.NodeInfo
-	for _, n := range allNodes {
-		if _, isIngress := ingressSet[n.Name]; !isIngress {
-			staleNodes = append(staleNodes, n)
+	metrics.AliasCleanupNodes.Set(float64(len(staleAliasNodes)))
+
+	landbSetNodes, staleLandbSetNodes := splitLandbSetNodes(allNodes)
+	log.Info("Nodes with landb-set", "count", len(landbSetNodes))
+	for _, n := range landbSetNodes {
+		log.V(1).Info("  Landb set node", "name", n.Name, "landbSet", n.LandbSet)
+	}
+	log.Info("Stale landb-set nodes", "count", len(staleLandbSetNodes))
+	for _, n := range staleLandbSetNodes {
+		if !n.Ready && n.LandbSet != "" {
+			log.Info("Skipping NotReady landb-set node", "node", n.Name)
 		}
+		log.V(1).Info("  Stale landb-set node", "name", n.Name)
 	}
-	log.V(1).Info("Stale nodes", "count", len(staleNodes))
+	metrics.LandbSetNodesManaged.Set(float64(len(landbSetNodes)))
+	metrics.LandbSetCleanupNodes.Set(float64(len(staleLandbSetNodes)))
 
 	// Step 4: Sync with the provider.
-	desired := provider.AliasSet{
-		Aliases:    aliases,
-		Nodes:      nodes,
-		StaleNodes: staleNodes,
+	desired := provider.DesiredState{
+		Aliases:            aliases,
+		IngressNodes:       ingressNodes,
+		StaleAliasNodes:    staleAliasNodes,
+		LandbSetNodes:      landbSetNodes,
+		StaleLandbSetNodes: staleLandbSetNodes,
 	}
 	if err := c.Provider.Sync(ctx, desired); err != nil {
 		return fmt.Errorf("provider sync: %w", err)
@@ -215,11 +236,11 @@ func (c *Controller) listAliases(ctx context.Context) ([]string, error) {
 	return aliases, nil
 }
 
-// listNodes returns ingress-labeled nodes sorted alphabetically by name.
+// listIngressNodes returns ingress-labeled nodes sorted alphabetically by name.
 // A node is selected if it carries any of the configured ingress labels.
 // The sorted order is critical because the node's index determines its
 // --load-N- suffix.
-func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error) {
+func (c *Controller) listIngressNodes(ctx context.Context) ([]provider.NodeInfo, error) {
 	log := log.FromContext(ctx)
 	log.V(1).Info("Listing ingress nodes", "labels", c.IngressNodeLabels)
 
@@ -250,8 +271,10 @@ func (c *Controller) listNodes(ctx context.Context) ([]provider.NodeInfo, error)
 				log.Info("Skipping NotReady ingress node", "node", node.Name)
 				continue
 			}
-			nodes = append(nodes, provider.NodeInfo{Name: node.Name})
-			log.V(1).Info("Ingress node found", "node", node.Name, "matchedLabel", sel.String())
+			nodeInfo := nodeInfoFromNode(node)
+			nodes = append(nodes, nodeInfo)
+			log.V(1).Info("Ingress node found", "node", node.Name,
+				"landbSet", nodeInfo.LandbSet, "matchedLabel", sel.String())
 		}
 	}
 
@@ -277,7 +300,7 @@ func (c *Controller) listAllNodes(ctx context.Context) ([]provider.NodeInfo, err
 	var nodes []provider.NodeInfo
 	for i := range nodeList.Items {
 		node := &nodeList.Items[i]
-		nodes = append(nodes, provider.NodeInfo{Name: node.Name})
+		nodes = append(nodes, nodeInfoFromNode(node))
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -285,6 +308,69 @@ func (c *Controller) listAllNodes(ctx context.Context) ([]provider.NodeInfo, err
 	})
 
 	return nodes, nil
+}
+
+func buildStaleAliasNodes(allNodes, ingressNodes []provider.NodeInfo) []provider.NodeInfo {
+	ingressSet := make(map[string]struct{}, len(ingressNodes))
+	for _, n := range ingressNodes {
+		ingressSet[n.Name] = struct{}{}
+	}
+
+	var staleAliasNodes []provider.NodeInfo
+	for _, n := range allNodes {
+		if _, isIngress := ingressSet[n.Name]; !isIngress {
+			staleAliasNodes = append(staleAliasNodes, n)
+		}
+	}
+	return staleAliasNodes
+}
+
+func splitLandbSetNodes(allNodes []provider.NodeInfo) ([]provider.NodeInfo, []provider.NodeInfo) {
+	var landbSetNodes []provider.NodeInfo
+	var staleLandbSetNodes []provider.NodeInfo
+	for _, n := range allNodes {
+		if n.Ready && n.LandbSet != "" {
+			landbSetNodes = append(landbSetNodes, n)
+			continue
+		}
+		staleLandbSetNodes = append(staleLandbSetNodes, n)
+	}
+	return landbSetNodes, staleLandbSetNodes
+}
+
+func nodeInfoFromNode(node *v1.Node) provider.NodeInfo {
+	return provider.NodeInfo{
+		Name:     node.Name,
+		Ready:    isNodeReady(node),
+		LandbSet: nodeLandbSet(node),
+	}
+}
+
+func nodeLandbSet(node *v1.Node) string {
+	if _, ok := node.Annotations[landbSetAnnotation]; ok {
+		return normalizeLandbSet(node.Annotations[landbSetAnnotation])
+	}
+	return normalizeLandbSet(node.Labels[landbSetLabel])
+}
+
+func normalizeLandbSet(value string) string {
+	parts := strings.Split(value, ",")
+	seen := make(map[string]struct{}, len(parts))
+	sets := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		set := strings.TrimSpace(part)
+		if set == "" {
+			continue
+		}
+		if _, exists := seen[set]; exists {
+			continue
+		}
+		seen[set] = struct{}{}
+		sets = append(sets, set)
+	}
+
+	return strings.Join(sets, ",")
 }
 
 // isNodeReady returns true if the node has a Ready condition with status True.

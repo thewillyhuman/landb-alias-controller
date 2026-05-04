@@ -17,6 +17,10 @@ const (
 	// system. Keys are "landb-alias", "landb-alias2", "landb-alias3", etc.
 	landbAliasPrefix = "landb-alias"
 
+	// landbSetMetadataKey is the OpenStack metadata key used to declare the
+	// landb set for a server.
+	landbSetMetadataKey = "landb-set"
+
 	// metadataCharLimit is the maximum length of a single metadata value.
 	// OpenStack allows 255 characters, but we use 200 for safety margin.
 	metadataCharLimit = 200

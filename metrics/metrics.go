@@ -39,12 +39,48 @@ var (
 		},
 	)
 
-	// NodesManaged reports the number of ingress-labeled nodes the
-	// controller is managing.
+	// NodesManaged reports the total number of Kubernetes nodes considered
+	// during reconciliation.
 	NodesManaged = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "landb_nodes_managed_total",
-			Help: "Number of ingress nodes currently managed.",
+			Help: "Number of Kubernetes nodes considered for alias or landb-set reconciliation.",
+		},
+	)
+
+	// IngressNodesManaged reports the number of Ready ingress nodes used for
+	// landb-alias metadata.
+	IngressNodesManaged = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "landb_ingress_nodes_managed_total",
+			Help: "Number of Ready ingress nodes currently managed for landb-alias metadata.",
+		},
+	)
+
+	// AliasCleanupNodes reports the number of nodes that should not serve
+	// aliases and are checked for stale landb-alias metadata.
+	AliasCleanupNodes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "landb_alias_cleanup_nodes_total",
+			Help: "Number of nodes checked for stale landb-alias metadata.",
+		},
+	)
+
+	// LandbSetNodesManaged reports the number of Ready nodes declaring one or
+	// more landb-set values through annotation or label.
+	LandbSetNodesManaged = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "landb_set_nodes_managed_total",
+			Help: "Number of Ready nodes currently declaring one or more landb-set metadata values.",
+		},
+	)
+
+	// LandbSetCleanupNodes reports the number of nodes without an active
+	// desired landb-set value list that are checked for stale landb-set metadata.
+	LandbSetCleanupNodes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "landb_set_cleanup_nodes_total",
+			Help: "Number of nodes checked for stale landb-set metadata, including NotReady nodes.",
 		},
 	)
 
@@ -77,6 +113,10 @@ func init() {
 		ReconciliationDuration,
 		AliasesDesired,
 		NodesManaged,
+		IngressNodesManaged,
+		AliasCleanupNodes,
+		LandbSetNodesManaged,
+		LandbSetCleanupNodes,
 		OpenStackAPICalls,
 		OpenStackAPIDuration,
 	)

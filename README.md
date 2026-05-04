@@ -10,7 +10,8 @@ create the corresponding DNS records.
 2. It extracts `.cern.ch` hosts from Ingress specs (e.g., `myapp.cern.ch` becomes alias `myapp`).
 3. It identifies ingress nodes via a configurable Kubernetes label.
 4. It writes the aliases as `landb-alias` metadata on the corresponding OpenStack servers.
-5. CERN's LANDB system reads that metadata and creates DNS records pointing to the ingress nodes.
+5. It writes optional node-level LANDB set metadata from Kubernetes node metadata.
+6. CERN's LANDB system reads that metadata and creates DNS records pointing to the ingress nodes.
 
 When multiple ingress nodes exist, load-balancing suffixes (`--load-0-`, `--load-1-`, etc.)
 are appended automatically so that LANDB creates A records for DNS round-robin.
@@ -37,6 +38,44 @@ affected nodes but ensures the suffix range remains contiguous.
 | Ingress node becomes Ready again | Aliases are re-added on the next reconciliation |
 | Ingress resource created/updated | Aliases are synced across all ready ingress nodes |
 | Ingress resource deleted | Stale aliases are removed from all ingress nodes |
+
+### Landb Set Metadata
+
+Nodes can declare one or more OpenStack `landb-set` metadata values with the
+following annotation:
+
+```yaml
+metadata:
+  annotations:
+    landb.cern.ch/set: "MY-LANDB-SET,MY-OTHER-LANDB-SET"
+```
+
+For compatibility, a single value can also be declared as a label:
+
+```yaml
+metadata:
+  labels:
+    landb.cern.ch/set: "MY-LANDB-SET"
+```
+
+The controller reconciles this as node-level metadata for Ready nodes,
+independently from ingress alias membership:
+
+The value is parsed as a comma-separated list. Whitespace and empty entries are
+removed, duplicate entries are ignored, and the normalized comma-separated value
+is written to OpenStack metadata key `landb-set`. For multiple values, use the
+annotation form because Kubernetes label values cannot contain commas.
+
+| Node metadata | OpenStack action |
+|---------------|------------------|
+| Ready node with `landb.cern.ch/set: "MY-LANDB-SET,MY-OTHER-LANDB-SET"` annotation present | Create or update `landb-set=MY-LANDB-SET,MY-OTHER-LANDB-SET` |
+| Ready node with single-value `landb.cern.ch/set: "MY-LANDB-SET"` label present | Create or update `landb-set=MY-LANDB-SET` |
+| Annotation absent or empty | Remove stale `landb-set` metadata |
+| Node is NotReady or has no Ready condition | Remove stale `landb-set` metadata |
+| Node is not an ingress node | Still reconcile `landb-set`; only `landb-alias*` is tied to ingress status |
+
+
+Any manually added `landb-set` metadata on OpenStack servers whose Kubernetes nodes are missing the corresponding label/annotation, or are not Ready, will be removed by the controller, as it treats Kubernetes as the source of truth for both aliases and sets.
 
 ## Prerequisites
 
@@ -178,6 +217,10 @@ The controller exposes Prometheus metrics on the default controller-runtime metr
 | `landb_reconciliations_total` | Counter | Completed reconciliation cycles (label: `result`) |
 | `landb_reconciliation_duration_seconds` | Histogram | Reconciliation cycle duration |
 | `landb_aliases_desired_total` | Gauge | Unique desired aliases from Ingress resources |
-| `landb_nodes_managed_total` | Gauge | Ingress-labeled nodes currently managed |
+| `landb_nodes_managed_total` | Gauge | Kubernetes nodes considered for alias or landb-set reconciliation |
+| `landb_ingress_nodes_managed_total` | Gauge | Ready ingress nodes managed for `landb-alias*` metadata |
+| `landb_alias_cleanup_nodes_total` | Gauge | Nodes checked for stale `landb-alias*` metadata |
+| `landb_set_nodes_managed_total` | Gauge | Ready nodes declaring `landb-set` metadata |
+| `landb_set_cleanup_nodes_total` | Gauge | Nodes checked for stale `landb-set` metadata, including NotReady nodes |
 | `landb_openstack_api_calls_total` | Counter | OpenStack API calls (labels: `operation`, `result`) |
 | `landb_openstack_api_duration_seconds` | Histogram | OpenStack API call latency (label: `operation`) |
