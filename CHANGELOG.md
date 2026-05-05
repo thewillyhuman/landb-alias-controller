@@ -6,6 +6,14 @@ All notable changes to LanDB Alias Controller are listed here by release or date
 
 ## Versions
 
+### v0.0.7
+
+- (28772b8) refactor: rename go.mod and gofmt codebase — Jack Munday
+- (88b471f) feat: add landbset metadata reconciliation — Luis Pigueiras
+- (1ca8e12) fix: remove node IP check to filter ingress nodes — Luis Pigueiras
+- (f1baba4) docs: document load-balancing suffix assignment order — Guillermo Facundo Colunga
+- (cc3605e) chore: update CHANGELOG — Guillermo Facundo Colunga
+
 ### v0.0.6
 
 - (4b71966) feat: support multiple ingress node label selectors — Guillermo Facundo Colunga
