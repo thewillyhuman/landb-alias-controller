@@ -20,8 +20,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/metrics"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/metrics"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider"
 )
 
 const (

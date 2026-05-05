@@ -7,14 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/metrics"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
-
-	"github.com/go-logr/logr"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/metrics"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider"
 )
 
 // computeAPI abstracts the OpenStack compute (Nova) operations needed

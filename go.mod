@@ -1,4 +1,4 @@
-module gitlab.cern.ch/gfacundo/landb-alias-controller
+module gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller
 
 go 1.24.4
 

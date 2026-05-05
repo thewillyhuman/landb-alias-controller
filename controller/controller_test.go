@@ -7,14 +7,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider"
 )
 
 // --- mockProvider: test double for provider.Provider ---

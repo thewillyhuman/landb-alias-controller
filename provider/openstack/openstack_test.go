@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider"
 )
 
 // --- mockCompute: test double for computeAPI ---

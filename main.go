@@ -30,10 +30,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/controller"
-	_ "gitlab.cern.ch/gfacundo/landb-alias-controller/metrics" // Register metrics on init.
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider"
-	"gitlab.cern.ch/gfacundo/landb-alias-controller/provider/openstack"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/controller"
+	_ "gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/metrics" // Register metrics on init.
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider"
+	"gitlab.cern.ch/kubernetes/networking/landb-controller/landb-alias-controller/provider/openstack"
 )
 
 const (
@@ -89,7 +89,8 @@ func run() error {
 
 	labels := parseLabels(ingressNodeLabels)
 
-	log.Info("Starting landb-alias-controller",
+	log.Info(
+		"Starting landb-alias-controller",
 		"provider", providerName,
 		"ingressNodeLabels", labels,
 		"cloudConfigSecret", cloudConfigSecret,
@@ -139,7 +140,8 @@ func buildAuthOptions(cloudConfigSecret string, reader client.Reader) (gopherclo
 		namespace, name, ok := strings.Cut(cloudConfigSecret, "/")
 		if !ok {
 			return gophercloud.AuthOptions{}, fmt.Errorf(
-				"invalid --cloud-config-secret format %q; expected namespace/name", cloudConfigSecret)
+				"invalid --cloud-config-secret format %q; expected namespace/name", cloudConfigSecret,
+			)
 		}
 		return openstack.ReadCloudConfigSecret(context.Background(), reader, namespace, name)
 	}
@@ -258,7 +260,8 @@ func setupController(mgr ctrl.Manager, prov provider.Provider, ingressNodeLabels
 		// Reconcile on relevant Node changes. All node events map to the same
 		// reconcile key to avoid thundering herd when multiple nodes change
 		// simultaneously.
-		Watches(&corev1.Node{},
+		Watches(
+			&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(
 				func(_ context.Context, _ client.Object) []reconcile.Request {
 					return []reconcile.Request{{
