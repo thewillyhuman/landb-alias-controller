@@ -35,9 +35,7 @@ type computeAPI interface {
 // alias system. DNS aliases are stored as server metadata properties on
 // ingress nodes; a separate CERN service reads these and updates DNS.
 type Provider struct {
-	// authOpts holds the OpenStack authentication options. Supports both
-	// username-based auth (Username/Password/TenantName/DomainName) and
-	// trust-based auth (UserID/Password/TrustID) from cloud-config.
+	// authOpts holds the OpenStack authentication options.
 	authOpts gophercloud.AuthOptions
 
 	// password is kept as a byte slice for secure zeroing after use.
@@ -70,9 +68,12 @@ func NewProvider(log logr.Logger, authOpts gophercloud.AuthOptions) (*Provider, 
 	}
 
 	logFields := []interface{}{"endpoint", p.authOpts.IdentityEndpoint}
-	if p.authOpts.UserID != "" {
+	switch {
+	case p.authOpts.ApplicationCredentialID != "":
+		logFields = append(logFields, "applicationCredentialID", p.authOpts.ApplicationCredentialID)
+	case p.authOpts.UserID != "":
 		logFields = append(logFields, "userID", p.authOpts.UserID)
-	} else {
+	default:
 		logFields = append(logFields, "tenant", p.authOpts.TenantName, "user", p.authOpts.Username)
 	}
 	p.log.Info("OpenStack provider initialized", logFields...)
@@ -81,7 +82,8 @@ func NewProvider(log logr.Logger, authOpts gophercloud.AuthOptions) (*Provider, 
 }
 
 // validateAuthOptions ensures all required authentication fields are
-// present. It supports two modes:
+// present. It supports three modes:
+//   - Application-credential (ApplicationCredentialID set): requires IdentityEndpoint, ApplicationCredentialID, ApplicationCredentialSecret
 //   - Trust-based (UserID set): requires IdentityEndpoint, UserID, Password, TrustID
 //   - Username-based (Username set): requires IdentityEndpoint, Username, Password, TenantName, DomainName
 func (p *Provider) validateAuthOptions() error {
@@ -90,25 +92,34 @@ func (p *Provider) validateAuthOptions() error {
 	if p.authOpts.IdentityEndpoint == "" {
 		missing = append(missing, "identity-endpoint")
 	}
-	if p.authOpts.Password == "" {
-		missing = append(missing, "password")
-	}
 
-	if p.authOpts.UserID != "" {
+	switch {
+	case p.authOpts.ApplicationCredentialID != "":
+		// Application-credential auth (cloud-config mode).
+		if p.authOpts.ApplicationCredentialSecret == "" {
+			missing = append(missing, "application-credential-secret")
+		}
+	case p.authOpts.UserID != "":
 		// Trust-based auth (cloud-config mode).
+		if p.authOpts.Password == "" {
+			missing = append(missing, "password")
+		}
 		if p.authOpts.Scope == nil || p.authOpts.Scope.TrustID == "" {
 			missing = append(missing, "trust-id")
 		}
-	} else if p.authOpts.Username != "" {
+	case p.authOpts.Username != "":
 		// Username-based auth (env var mode).
+		if p.authOpts.Password == "" {
+			missing = append(missing, "password")
+		}
 		if p.authOpts.TenantName == "" {
 			missing = append(missing, "tenant-name")
 		}
 		if p.authOpts.DomainName == "" {
 			missing = append(missing, "domain-name")
 		}
-	} else {
-		missing = append(missing, "user-id or username")
+	default:
+		missing = append(missing, "user-id, username, or application-credential-id")
 	}
 
 	if len(missing) > 0 {

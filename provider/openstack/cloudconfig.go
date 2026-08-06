@@ -17,7 +17,9 @@ import (
 // OpenStack authentication options. Only the [Global] section is read;
 // other sections are ignored.
 //
-// Expected keys: auth-url, user-id, password, trust-id.
+// Expected keys are either auth-url, user-id, password, trust-id
+// (trust-based auth), or auth-url, application-credential-id,
+// application-credential-secret (application credential auth).
 func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
 	var opts gophercloud.AuthOptions
 	inGlobal := false
@@ -62,6 +64,10 @@ func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
 				opts.Scope = &gophercloud.AuthScope{}
 			}
 			opts.Scope.TrustID = value
+		case "application-credential-id":
+			opts.ApplicationCredentialID = value
+		case "application-credential-secret":
+			opts.ApplicationCredentialSecret = value
 		}
 	}
 
@@ -69,19 +75,25 @@ func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
 		return gophercloud.AuthOptions{}, fmt.Errorf("reading cloud config: %w", err)
 	}
 
-	// Validate required fields.
+	// Validate required fields based on auth mode.
 	var missing []string
 	if opts.IdentityEndpoint == "" {
 		missing = append(missing, "auth-url")
 	}
-	if opts.UserID == "" {
-		missing = append(missing, "user-id")
-	}
-	if opts.Password == "" {
-		missing = append(missing, "password")
-	}
-	if opts.Scope == nil || opts.Scope.TrustID == "" {
-		missing = append(missing, "trust-id")
+	if opts.ApplicationCredentialID != "" {
+		if opts.ApplicationCredentialSecret == "" {
+			missing = append(missing, "application-credential-secret")
+		}
+	} else {
+		if opts.UserID == "" {
+			missing = append(missing, "user-id")
+		}
+		if opts.Password == "" {
+			missing = append(missing, "password")
+		}
+		if opts.Scope == nil || opts.Scope.TrustID == "" {
+			missing = append(missing, "trust-id")
+		}
 	}
 	if len(missing) > 0 {
 		return gophercloud.AuthOptions{}, fmt.Errorf("cloud config missing required fields: %s",

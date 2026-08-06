@@ -100,9 +100,11 @@ credential configuration:
 --cloud-config-secret=kube-system/cloud-config
 ```
 
-This uses trust-based authentication (`user-id` + `trust-id`) from the secret's `cloud.conf` key.
-The controller's service account needs RBAC permission to `get` the secret (see the Helm chart's
-`cloudConfig.enabled` option which sets this up automatically).
+The secret's `cloud.conf` key is read for either trust-based authentication (`user-id` +
+`password` + `trust-id`) or application-credential authentication (`application-credential-id` +
+`application-credential-secret`), depending on which fields are present. The controller's service
+account needs RBAC permission to `get` the secret (see the Helm chart's `cloudConfig.enabled`
+option which sets this up automatically).
 
 #### Option 2: Environment Variables
 

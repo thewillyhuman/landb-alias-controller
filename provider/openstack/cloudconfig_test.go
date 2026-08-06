@@ -115,6 +115,31 @@ user-id = "uid"
 	assert.Contains(t, err.Error(), "trust-id")
 }
 
+func TestParseCloudConfig_ApplicationCredential(t *testing.T) {
+	input := []byte(`[Global]
+auth-url = "https://keystone.cern.ch/v3"
+application-credential-id = "app-cred-id"
+application-credential-secret = "app-cred-secret"
+`)
+
+	opts, err := parseCloudConfig(input)
+	require.NoError(t, err)
+	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
+	assert.Equal(t, "app-cred-id", opts.ApplicationCredentialID)
+	assert.Equal(t, "app-cred-secret", opts.ApplicationCredentialSecret)
+}
+
+func TestParseCloudConfig_MissingApplicationCredentialSecret(t *testing.T) {
+	input := []byte(`[Global]
+auth-url = "https://keystone.cern.ch/v3"
+application-credential-id = "app-cred-id"
+`)
+
+	_, err := parseCloudConfig(input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "application-credential-secret")
+}
+
 func TestParseCloudConfig_EmptyInput(t *testing.T) {
 	_, err := parseCloudConfig([]byte{})
 	require.Error(t, err)
@@ -224,6 +249,29 @@ func TestValidateAuthOptions_UsernameBased(t *testing.T) {
 	assert.NoError(t, p.validateAuthOptions())
 }
 
+func TestValidateAuthOptions_ApplicationCredential(t *testing.T) {
+	p := &Provider{
+		authOpts: gophercloud.AuthOptions{
+			IdentityEndpoint:            "https://keystone.cern.ch/v3",
+			ApplicationCredentialID:     "app-cred-id",
+			ApplicationCredentialSecret: "app-cred-secret",
+		},
+	}
+	assert.NoError(t, p.validateAuthOptions())
+}
+
+func TestValidateAuthOptions_ApplicationCredentialMissingSecret(t *testing.T) {
+	p := &Provider{
+		authOpts: gophercloud.AuthOptions{
+			IdentityEndpoint:        "https://keystone.cern.ch/v3",
+			ApplicationCredentialID: "app-cred-id",
+		},
+	}
+	err := p.validateAuthOptions()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "application-credential-secret")
+}
+
 func TestValidateAuthOptions_NoUserIdentity(t *testing.T) {
 	p := &Provider{
 		authOpts: gophercloud.AuthOptions{
@@ -233,7 +281,7 @@ func TestValidateAuthOptions_NoUserIdentity(t *testing.T) {
 	}
 	err := p.validateAuthOptions()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user-id or username")
+	assert.Contains(t, err.Error(), "user-id, username, or application-credential-id")
 }
 
 func TestValidateAuthOptions_TrustBasedMissingTrustID(t *testing.T) {
