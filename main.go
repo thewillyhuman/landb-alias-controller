@@ -123,35 +123,38 @@ func run() error {
 func initProvider(name string, log logr.Logger, cloudConfigSecret string, reader client.Reader) (provider.Provider, error) {
 	switch name {
 	case providerOpenStack:
-		authOpts, err := buildAuthOptions(cloudConfigSecret, reader)
+		authCfg, err := buildAuthOptions(cloudConfigSecret, reader)
 		if err != nil {
 			return nil, err
 		}
-		return openstack.NewProvider(log, authOpts)
+		return openstack.NewProvider(log, authCfg)
 	default:
 		return nil, errors.New(fmt.Sprintf("unknown provider %q; supported: %s", name, providerOpenStack))
 	}
 }
 
-// buildAuthOptions constructs OpenStack auth options from either a
-// cloud-config Kubernetes secret or environment variables.
-func buildAuthOptions(cloudConfigSecret string, reader client.Reader) (gophercloud.AuthOptions, error) {
+// buildAuthOptions constructs OpenStack auth options and region from either
+// a cloud-config Kubernetes secret or environment variables.
+func buildAuthOptions(cloudConfigSecret string, reader client.Reader) (openstack.AuthConfig, error) {
 	if cloudConfigSecret != "" {
 		namespace, name, ok := strings.Cut(cloudConfigSecret, "/")
 		if !ok {
-			return gophercloud.AuthOptions{}, fmt.Errorf(
+			return openstack.AuthConfig{}, fmt.Errorf(
 				"invalid --cloud-config-secret format %q; expected namespace/name", cloudConfigSecret,
 			)
 		}
 		return openstack.ReadCloudConfigSecret(context.Background(), reader, namespace, name)
 	}
 
-	return gophercloud.AuthOptions{
-		IdentityEndpoint: os.Getenv("OS_AUTH_URL"),
-		Username:         os.Getenv("OS_USERNAME"),
-		Password:         os.Getenv("OS_PASSWORD"),
-		TenantName:       os.Getenv("OS_PROJECT_NAME"),
-		DomainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
+	return openstack.AuthConfig{
+		AuthOptions: gophercloud.AuthOptions{
+			IdentityEndpoint: os.Getenv("OS_AUTH_URL"),
+			Username:         os.Getenv("OS_USERNAME"),
+			Password:         os.Getenv("OS_PASSWORD"),
+			TenantName:       os.Getenv("OS_PROJECT_NAME"),
+			DomainName:       os.Getenv("OS_USER_DOMAIN_NAME"),
+		},
+		Region: os.Getenv("OS_REGION_NAME"),
 	}, nil
 }
 

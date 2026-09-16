@@ -28,13 +28,14 @@ internal-network-name = "CERN_NETWORK"
 cascade-delete = "true"
 `)
 
-	opts, err := parseCloudConfig(input)
+	cfg, err := parseCloudConfig(input)
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
-	assert.Equal(t, "5f9112836737466091abbb6c24397f0c", opts.UserID)
-	assert.Equal(t, "PjVH9tpHaCYaDd4nZx", opts.Password)
-	require.NotNil(t, opts.Scope)
-	assert.Equal(t, "b5f17e795efe439995b9c7f982f6e460", opts.Scope.TrustID)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
+	assert.Equal(t, "5f9112836737466091abbb6c24397f0c", cfg.AuthOptions.UserID)
+	assert.Equal(t, "PjVH9tpHaCYaDd4nZx", cfg.AuthOptions.Password)
+	assert.Equal(t, "cern", cfg.Region)
+	require.NotNil(t, cfg.AuthOptions.Scope)
+	assert.Equal(t, "b5f17e795efe439995b9c7f982f6e460", cfg.AuthOptions.Scope.TrustID)
 }
 
 func TestParseCloudConfig_UnquotedValues(t *testing.T) {
@@ -45,12 +46,12 @@ trust-id = abc123
 user-id = def456
 `)
 
-	opts, err := parseCloudConfig(input)
+	cfg, err := parseCloudConfig(input)
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
-	assert.Equal(t, "secret123", opts.Password)
-	assert.Equal(t, "abc123", opts.Scope.TrustID)
-	assert.Equal(t, "def456", opts.UserID)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
+	assert.Equal(t, "secret123", cfg.AuthOptions.Password)
+	assert.Equal(t, "abc123", cfg.AuthOptions.Scope.TrustID)
+	assert.Equal(t, "def456", cfg.AuthOptions.UserID)
 }
 
 func TestParseCloudConfig_ExtraWhitespace(t *testing.T) {
@@ -61,10 +62,10 @@ func TestParseCloudConfig_ExtraWhitespace(t *testing.T) {
   user-id  =  "uid"
 `)
 
-	opts, err := parseCloudConfig(input)
+	cfg, err := parseCloudConfig(input)
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
-	assert.Equal(t, "secret", opts.Password)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
+	assert.Equal(t, "secret", cfg.AuthOptions.Password)
 }
 
 func TestParseCloudConfig_MissingAuthURL(t *testing.T) {
@@ -122,11 +123,11 @@ application-credential-id = "app-cred-id"
 application-credential-secret = "app-cred-secret"
 `)
 
-	opts, err := parseCloudConfig(input)
+	cfg, err := parseCloudConfig(input)
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
-	assert.Equal(t, "app-cred-id", opts.ApplicationCredentialID)
-	assert.Equal(t, "app-cred-secret", opts.ApplicationCredentialSecret)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
+	assert.Equal(t, "app-cred-id", cfg.AuthOptions.ApplicationCredentialID)
+	assert.Equal(t, "app-cred-secret", cfg.AuthOptions.ApplicationCredentialSecret)
 }
 
 func TestParseCloudConfig_MissingApplicationCredentialSecret(t *testing.T) {
@@ -156,9 +157,9 @@ trust-id = "tid"
 user-id = "uid"
 `)
 
-	opts, err := parseCloudConfig(input)
+	cfg, err := parseCloudConfig(input)
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
 }
 
 func TestParseCloudConfig_NoGlobalSection(t *testing.T) {
@@ -191,13 +192,13 @@ user-id = "uid"
 	}
 
 	fakeClient := fake.NewClientBuilder().WithObjects(secret).Build()
-	opts, err := ReadCloudConfigSecret(context.Background(), fakeClient, "kube-system", "cloud-config")
+	cfg, err := ReadCloudConfigSecret(context.Background(), fakeClient, "kube-system", "cloud-config")
 	require.NoError(t, err)
-	assert.Equal(t, "https://keystone.cern.ch/v3", opts.IdentityEndpoint)
-	assert.Equal(t, "uid", opts.UserID)
-	assert.Equal(t, "secret", opts.Password)
-	require.NotNil(t, opts.Scope)
-	assert.Equal(t, "tid", opts.Scope.TrustID)
+	assert.Equal(t, "https://keystone.cern.ch/v3", cfg.AuthOptions.IdentityEndpoint)
+	assert.Equal(t, "uid", cfg.AuthOptions.UserID)
+	assert.Equal(t, "secret", cfg.AuthOptions.Password)
+	require.NotNil(t, cfg.AuthOptions.Scope)
+	assert.Equal(t, "tid", cfg.AuthOptions.Scope.TrustID)
 }
 
 func TestReadCloudConfigSecret_NotFound(t *testing.T) {

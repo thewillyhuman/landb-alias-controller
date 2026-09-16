@@ -38,6 +38,9 @@ type Provider struct {
 	// authOpts holds the OpenStack authentication options.
 	authOpts gophercloud.AuthOptions
 
+	// region selects which service catalog endpoint to use.
+	region string
+
 	// password is kept as a byte slice for secure zeroing after use.
 	password []byte
 
@@ -50,12 +53,13 @@ type Provider struct {
 
 // NewProvider creates and authenticates a new OpenStack Provider.
 //
-// The authOpts parameter contains pre-built authentication options,
-// either from environment variables or from a cloud-config secret.
-func NewProvider(log logr.Logger, authOpts gophercloud.AuthOptions) (*Provider, error) {
+// cfg contains pre-built authentication options and region, either from
+// environment variables or from a cloud-config secret.
+func NewProvider(log logr.Logger, cfg AuthConfig) (*Provider, error) {
 	p := &Provider{
-		authOpts: authOpts,
-		password: []byte(authOpts.Password),
+		authOpts: cfg.AuthOptions,
+		region:   cfg.Region,
+		password: []byte(cfg.AuthOptions.Password),
 		log:      log.WithName("openstack"),
 	}
 
@@ -67,7 +71,7 @@ func NewProvider(log logr.Logger, authOpts gophercloud.AuthOptions) (*Provider, 
 		return nil, fmt.Errorf("OpenStack authentication failed: %w", err)
 	}
 
-	logFields := []interface{}{"endpoint", p.authOpts.IdentityEndpoint}
+	logFields := []interface{}{"endpoint", p.authOpts.IdentityEndpoint, "region", p.region}
 	switch {
 	case p.authOpts.ApplicationCredentialID != "":
 		logFields = append(logFields, "applicationCredentialID", p.authOpts.ApplicationCredentialID)
@@ -136,7 +140,7 @@ func (p *Provider) authenticate() error {
 		return fmt.Errorf("keystone authentication failed: %w", err)
 	}
 
-	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{})
+	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{Region: p.region})
 	if err != nil {
 		return fmt.Errorf("compute client creation failed: %w", err)
 	}

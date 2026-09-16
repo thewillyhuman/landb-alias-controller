@@ -13,15 +13,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// AuthConfig bundles OpenStack authentication options with the region
+// used to select the service catalog endpoint (e.g. CERN's "pdc" region
+// resolves to openstackpdc.cern.ch instead of the default openstack.cern.ch).
+type AuthConfig struct {
+	AuthOptions gophercloud.AuthOptions
+	Region      string
+}
+
 // parseCloudConfig parses an INI-format cloud.conf file and extracts
-// OpenStack authentication options. Only the [Global] section is read;
-// other sections are ignored.
+// OpenStack authentication options and region. Only the [Global] section
+// is read; other sections are ignored.
 //
 // Expected keys are either auth-url, user-id, password, trust-id
 // (trust-based auth), or auth-url, application-credential-id,
-// application-credential-secret (application credential auth).
-func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
+// application-credential-secret (application credential auth), plus an
+// optional region key.
+func parseCloudConfig(data []byte) (AuthConfig, error) {
 	var opts gophercloud.AuthOptions
+	var region string
 	inGlobal := false
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
@@ -68,11 +78,13 @@ func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
 			opts.ApplicationCredentialID = value
 		case "application-credential-secret":
 			opts.ApplicationCredentialSecret = value
+		case "region":
+			region = value
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return gophercloud.AuthOptions{}, fmt.Errorf("reading cloud config: %w", err)
+		return AuthConfig{}, fmt.Errorf("reading cloud config: %w", err)
 	}
 
 	// Validate required fields based on auth mode.
@@ -96,25 +108,25 @@ func parseCloudConfig(data []byte) (gophercloud.AuthOptions, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return gophercloud.AuthOptions{}, fmt.Errorf("cloud config missing required fields: %s",
+		return AuthConfig{}, fmt.Errorf("cloud config missing required fields: %s",
 			strings.Join(missing, ", "))
 	}
 
-	return opts, nil
+	return AuthConfig{AuthOptions: opts, Region: region}, nil
 }
 
 // ReadCloudConfigSecret reads the cloud-config Secret from the given
-// namespace and parses it into OpenStack authentication options.
-func ReadCloudConfigSecret(ctx context.Context, reader client.Reader, namespace, name string) (gophercloud.AuthOptions, error) {
+// namespace and parses it into OpenStack authentication options and region.
+func ReadCloudConfigSecret(ctx context.Context, reader client.Reader, namespace, name string) (AuthConfig, error) {
 	var secret corev1.Secret
 	nn := types.NamespacedName{Namespace: namespace, Name: name}
 	if err := reader.Get(ctx, nn, &secret); err != nil {
-		return gophercloud.AuthOptions{}, fmt.Errorf("reading secret %s/%s: %w", namespace, name, err)
+		return AuthConfig{}, fmt.Errorf("reading secret %s/%s: %w", namespace, name, err)
 	}
 
 	data, ok := secret.Data["cloud.conf"]
 	if !ok {
-		return gophercloud.AuthOptions{}, fmt.Errorf("secret %s/%s has no 'cloud.conf' key", namespace, name)
+		return AuthConfig{}, fmt.Errorf("secret %s/%s has no 'cloud.conf' key", namespace, name)
 	}
 
 	return parseCloudConfig(data)
